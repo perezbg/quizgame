@@ -1,0 +1,2112 @@
+#include <Wire.h>
+#include <WiFi.h>
+#include <WebServer.h>
+#include <Preferences.h>
+#include <time.h>
+#include <esp_system.h>
+#include <esp_arduino_version.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SH110X.h>
+#include <U8g2_for_Adafruit_GFX.h>
+
+// Change this value to set the points needed to win.
+const uint8_t TOTAL_POINTS_TO_WIN = 6;
+
+// Font controls: 1 = small, 2 = medium, 3 = large.
+// Long answer pairs step down only as much as needed to avoid overlap.
+const uint8_t QUESTION_FONT_SIZE = 2;
+const uint8_t ANSWER_FONT_SIZE = 3;
+const bool SHOW_SEPARATOR_LINE = false; // Set true to show the separator.
+const uint8_t SEPARATOR_LINE_THICKNESS = 3; // Pixels.
+
+const uint8_t BUZZER_PIN = 32;
+const unsigned long SHORT_BEEP_MS = 100;
+const uint16_t PLAYER1_BEEP_HZ = 880;
+const uint16_t PLAYER2_BEEP_HZ = 1320;
+const unsigned long RESTART_HOLD_MS = 3000UL;
+const unsigned long VICTORY_DURATION_MS = 15000UL;
+const uint8_t VICTORY_REPEAT_COUNT = 5;
+const uint16_t VICTORY_GAP_MS = 30;
+
+// Original, triumphant eight-note fanfare, played five times during celebration.
+const uint16_t VICTORY_NOTES[] = {523, 784, 1047, 1319, 1568, 1319, 1568, 2093};
+const uint16_t VICTORY_NOTE_MS[] = {180, 180, 220, 220, 360, 180, 240, 800};
+const uint8_t VICTORY_NOTE_COUNT = sizeof(VICTORY_NOTES) / sizeof(VICTORY_NOTES[0]);
+#if ESP_ARDUINO_VERSION_MAJOR < 3
+const uint8_t BUZZER_CHANNEL = 0;
+#endif
+
+// OLED 1: SDA 21, SCL 22 (SH1106)
+// OLED 2: SDA 25, SCL 26 (SH1106)
+const int16_t DISPLAY1_VERTICAL_OFFSET_Y = 4; // Moves all Display 1 text down in pixels. That was because my OLED 1 was broken on its upper rows.
+bool displayAvailable[2] = {false, false};
+bool soloMode = false;
+uint8_t soloPlayer = 0;
+TwoWire I2C_2 = TwoWire(1);
+Adafruit_SH1106G display1(128, 64, &Wire, -1);
+Adafruit_SH1106G display2(128, 64, &I2C_2, -1);
+
+U8G2_FOR_ADAFRUIT_GFX font1;
+U8G2_FOR_ADAFRUIT_GFX font2;
+U8G2_FOR_ADAFRUIT_GFX previewFont;
+GFXcanvas1 previewCanvas(128, 64);
+WebServer webServer(80);
+Preferences preferences;
+
+// The setup access point stays available even after joining the home Wi-Fi.
+const char* SETUP_WIFI_SSID = "QuizGame-Antim1";
+const char* SETUP_WIFI_PASSWORD = "12345678";
+const uint8_t MAX_QUESTIONS = 24;
+const uint8_t MAX_STUDENTS = 32;
+const uint8_t MIN_TOURNAMENT_POINTS_TO_WIN = 1;
+const uint8_t MAX_TOURNAMENT_POINTS_TO_WIN = 20;
+uint8_t tournamentPointsToWin = 3;
+const uint8_t GAME_MODE_CLASSIC = 0;
+const uint8_t GAME_MODE_TOURNAMENT = 1;
+
+int16_t displayTextY(int16_t y, int16_t offsetY) {
+int16_t shiftedY = y + offsetY;
+if (shiftedY < 0) return 0;
+if (shiftedY > 63) return 63;
+return shiftedY;
+}
+
+// Buttons: Player 1 A/B = GPIO 18/19; Player 2 A/B = GPIO 14/27.
+// Each button connects its GPIO to GND; INPUT_PULLUP is used.
+// Passive piezo buzzer: signal to GPIO 32 and other terminal to GND; use a transistor if it needs more current than the ESP32 pin can supply.
+const uint8_t BUTTON_PINS[4] = {18, 19, 14, 27};
+bool buttonStable[4] = {HIGH, HIGH, HIGH, HIGH};
+bool buttonLastReading[4] = {HIGH, HIGH, HIGH, HIGH};
+unsigned long buttonLastChange[4] = {0, 0, 0, 0};
+bool restartChordTiming[2] = {false, false};
+unsigned long restartChordStartedAt[2] = {0, 0};
+bool shortBeepActive = false;
+unsigned long shortBeepOffAt = 0;
+
+struct Question {
+char line1[64];
+char line2[64];
+char answerA[64];
+char answerB[64];
+uint8_t correctAnswer; // 0 = A, 1 = B
+};
+
+struct PeriodStats {
+uint32_t matchesPlayed;
+uint32_t matchesWon;
+uint32_t correctAnswers;
+uint32_t wrongAnswers;
+uint64_t totalCorrectMs;
+uint32_t fastestCorrectMs;
+int32_t windowKey;
+};
+
+struct StudentStats {
+char name[32];
+// Lifetime totals.
+uint32_t matchesPlayed;
+uint32_t matchesWon;
+uint32_t correctAnswers;
+uint32_t wrongAnswers;
+uint64_t totalCorrectMs;
+uint32_t fastestCorrectMs;
+// Independent period summaries, also stored in ESP32 nonvolatile memory.
+PeriodStats game;
+PeriodStats hour;
+PeriodStats day;
+PeriodStats week;
+};
+
+// Layout used by firmware versions before period-specific statistics were added.
+struct LegacyStudentStats {
+char name[32];
+uint32_t matchesPlayed;
+uint32_t matchesWon;
+uint32_t correctAnswers;
+uint32_t wrongAnswers;
+uint64_t totalCorrectMs;
+uint32_t fastestCorrectMs;
+};
+
+const uint8_t STATS_SCOPE_GAME = 1;
+const uint8_t STATS_SCOPE_HOUR = 2;
+const uint8_t STATS_SCOPE_DAY = 3;
+const uint8_t STATS_SCOPE_WEEK = 4;
+const uint8_t STATS_SCOPE_ALL = 5;
+
+char studentNames[MAX_STUDENTS][32];
+char absentNames[MAX_STUDENTS][32];
+uint8_t studentCount = 0;
+uint8_t absentCount = 0;
+String studentsCsv = "";
+String absentCsv = "";
+uint8_t gameMode = GAME_MODE_CLASSIC;
+StudentStats studentStats[MAX_STUDENTS] = {};
+bool tournamentActive = false;
+int8_t activeStudent[2] = {-1, -1};
+uint8_t tournamentOrder[MAX_STUDENTS];
+uint8_t tournamentOrderCount = 0;
+uint8_t tournamentOrderPosition = 0;
+uint32_t sessionMatchWins[MAX_STUDENTS] = {};
+uint32_t sessionMatchesPlayed[MAX_STUDENTS] = {};
+uint32_t sessionCorrectAnswers[MAX_STUDENTS] = {};
+uint64_t sessionCorrectMs[MAX_STUDENTS] = {};
+uint32_t sessionMatchCount = 0;
+bool studentStatsDirty[MAX_STUDENTS] = {};
+bool tournamentReadyPhase = false;
+bool readyForMatch[2] = {false, false};
+bool choosingOtherPlayer[2] = {false, false};
+uint8_t otherPlayerCandidates[2][MAX_STUDENTS] = {};
+uint8_t otherPlayerCandidateCount[2] = {0, 0};
+uint8_t otherPlayerSelection[2] = {0, 0};
+
+const Question defaultQuestions[] = {
+{"Как се казва", "вашето училище?", "Антим 1-ви", "Левски", 0},
+{"Колко е 2 + 3?", "", "5", "6", 0},
+{"Колко крака има", "едно куче?", "Четири", "Два", 0},
+{"Коя е първата", "буква в МАМА?", "A", "M", 1},
+{"Колко дни е", "една седмица?", "7", "2", 0},
+{"Кое животно", "казва мяу-мяу?", "Куче", "Котка", 1},
+{"Колко е 8-4?", "", "4", "5", 0},
+{"Коя е", "нашата планета?", "Земята", "Марс", 0},
+{"Кое число е", "по-голямо?", "8", "5", 0},
+{"Какъв цвят е", "тревата?", "Зелен", "Син", 0},
+{"Какъв ден е", "днес?", "{ДЕН_ОТ_СЕДМИЦАТА}", "{СЛЕДВАЩ_ДЕН}", 0},
+{"Коя е първата", "буква в Татко?", "К", "Т", 1}
+};
+Question questions[MAX_QUESTIONS];
+uint8_t QUESTION_COUNT = 0;
+
+uint8_t scores[2] = {0, 0};
+bool answered[2] = {false, false};
+bool answerWasCorrect[2] = {false, false};
+unsigned long answerTime[2] = {0, 0};
+
+int currentQuestion = -1;
+uint8_t correctButton = 0;
+unsigned long roundStartTime = 0;
+
+const unsigned long SCREENSAVER_IDLE_MS = 30000UL;
+unsigned long lastButtonActivityAt = 0;
+unsigned long lastClockFrameAt = 0;
+bool screensaverActive = false;
+
+const char* WEEKDAYS_BG[] = {"Неделя", "Понеделник", "Вторник", "Сряда", "Четвъртък", "Петък", "Събота"};
+const char* MONTHS_BG[] = {"януари", "февруари", "март", "април", "май", "юни", "юли", "август", "септември", "октомври", "ноември", "декември"};
+
+void startNewRound();
+void drawQuestionCore(Adafruit_GFX& canvas, U8G2_FOR_ADAFRUIT_GFX& font,
+const char* line1, const char* line2,
+const char* answerA, const char* answerB,
+int16_t offsetY);
+void handleRootPage();
+void handleStatusPage();
+void writeLittleEndian16(uint8_t* buffer, uint16_t offset, uint16_t value);
+void writeLittleEndian32(uint8_t* buffer, uint16_t offset, uint32_t value);
+bool parseNameCsv(const String& csv, char output[MAX_STUDENTS][32], uint8_t& count);
+void loadClassSettings();
+void saveStudentStats();
+void flushStudentStats();
+void handleClassData();
+void handleSaveClassSettings();
+void handleEndTournament();
+void handleResetStatistics();
+void startNextTournamentMatch();
+void finishTournament();
+bool startTournament();
+void showTournamentIdle();
+void showReadyPrompt(uint8_t player);
+void showReadyWaiting(uint8_t player);
+void showPlayerSelectionMenu(uint8_t player);
+void synchronizeButtonStates();
+void beginTournamentMatch();
+
+bool getLocalDateTime(struct tm& timeInfo) {
+time_t now = time(nullptr);
+if (now < 1700000000) return false; // NTP has not set the clock yet.
+return localtime_r(&now, &timeInfo) != nullptr;
+}
+
+String expandTemplate(const String& source) {
+struct tm t;
+String result = source;
+if (!getLocalDateTime(t)) {
+result.replace("{ДЕН_ОТ_СЕДМИЦАТА}", "няма час");
+result.replace("{СЛЕДВАЩ_ДЕН}", "няма час");
+result.replace("{ДАТА}", "--");
+result.replace("{МЕСЕЦ}", "няма час");
+result.replace("{ГОДИНА}", "----");
+return result;
+}
+result.replace("{ДЕН_ОТ_СЕДМИЦАТА}", WEEKDAYS_BG[t.tm_wday]);
+result.replace("{СЛЕДВАЩ_ДЕН}", WEEKDAYS_BG[(t.tm_wday + 1) % 7]);
+result.replace("{ДАТА}", String(t.tm_mday));
+result.replace("{МЕСЕЦ}", MONTHS_BG[t.tm_mon]);
+result.replace("{ГОДИНА}", String(t.tm_year + 1900));
+return result;
+}
+
+const char INDEX_HTML[] PROGMEM = R"rawliteral(<!doctype html>
+
+<html lang="bg"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Игра с въпроси</title>
+<style>
+:root{font-family:Arial,sans-serif;color:#17212b;background:#eef2f5}body{max-width:920px;margin:18px auto;padding:0 14px}h1{font-size:1.55rem}section{background:white;border-radius:12px;padding:16px;margin:14px 0;box-shadow:0 2px 10px #0001}label{display:block;font-weight:600;margin:10px 0 5px}input[type=text],input[type=password],select,textarea{box-sizing:border-box;width:100%;padding:10px;border:1px solid #aab5bf;border-radius:7px;font-size:1rem}button{border:0;border-radius:7px;padding:10px 14px;margin:8px 6px 0 0;background:#1666a8;color:white;font-size:1rem;cursor:pointer}.danger{background:#a83232}.radio{display:inline-flex;align-items:center;gap:5px;margin-right:16px}.radio label{display:inline;margin:0}.layout{display:grid;grid-template-columns:minmax(250px,1fr) 270px;gap:20px;align-items:start}.oled{width:256px;max-width:100%;height:auto;image-rendering:pixelated;background:#080808;border:12px solid #202020;border-radius:13px}.muted{color:#52606d;font-size:.92rem}.status{padding:9px;background:#eef7fc;border-radius:7px;word-break:break-word;white-space:pre-line}.stats-table{width:100%;border-collapse:collapse;text-align:center}.stats-table th,.stats-table td{border:1px solid #aab5bf;padding:6px;text-align:center}@media(max-width:650px){.layout{grid-template-columns:1fr}.preview{order:-1}}
+</style></head><body>
+<h1>Редактор на играта</h1><p class="muted">Редовете на въпроса се въвеждат отделно. Прегледът използва размера на OLED дисплея и същите шрифтове като играта.</p>
+<section><h2>Wi‑Fi</h2><div id="net" class="status">Зареждане…</div><div><button type="button" id="scanWifi">Сканирай за мрежи</button></div><label for="wifiNetworks">Избери налична мрежа</label><select id="wifiNetworks"><option value="">Първо сканирай за мрежи</option></select><form id="wifiForm"><label for="wifiSsid">Име на мрежата</label><input id="wifiSsid" name="ssid" type="text" maxlength="32" required><label>Парола</label><input name="password" type="password" maxlength="63"><button>Запази Wi‑Fi настройките</button></form><p class="muted">Изборът от списъка попълва името автоматично. Ако мрежата не се появи, въведи името ръчно. След запазване ESP32 ще се рестартира. Мрежата QuizGame-Antim1 остава достъпна за настройка.</p></section>
+<section><h2>Клас и режим на игра</h2>
+<label>Деца в класа, разделени със запетая</label><textarea id="students" rows="3" maxlength="1024" placeholder="Ани, Борис, Виктор"></textarea>
+<label>Отсъстващи деца, разделени със запетая</label><textarea id="absent" rows="2" maxlength="1024" placeholder="Борис"></textarea>
+<label>Тип игра</label><select id="gameMode"><option value="0">Всеки печели — както досега</option><option value="1">Истинска надпревара между децата</option></select>
+<label>Точки за победа в един мач</label><input id="pointsToWin" type="number" min="1" max="20" value="3">
+<button id="saveClass">Запази настройките</button><button id="endTournament" class="danger">Край и обяви победителя</button>
+<p class="muted">При избран режим „Истинска надпревара“ играта започва автоматично след запазване на настройките (и при включване на ESP32). Всеки мач започва, когато и двете деца натиснат „Да“. Първи до зададения брой точки печели мача. Натисни „Край и обяви победителя“, когато приключат. Победителят се определя по спечелени мачове, после по верни отговори и средно време.</p>
+<p id="classMessage" class="muted">За надпревара са нужни поне две присъстващи деца и два работещи дисплея.</p>
+<h3>Статистика</h3>
+<label>Период</label><select id="statsScope"><option value="1">Последната игра</option><option value="2">Последния час</option><option value="3">Последния ден</option><option value="4">Последната седмица</option><option value="5">Цялото време</option></select>
+<button id="resetStatistics" class="danger">Нулирай избрания период</button>
+<p class="muted">Статистиката се пази в ESP32. Часът, денят и седмицата се сменят по календарните граници; за тях е нужен синхронизиран час и интернет.</p>
+<div id="statsTable" class="muted">Още няма статистика.</div>
+</section>
+<section><h2>Въпроси</h2><div class="layout"><div>
+<label>Избери въпрос за редакция</label><select id="questionList"></select>
+<label>Въпрос — ред 1</label><input id="line1" type="text" maxlength="31">
+<label>Въпрос — ред 2 (остави празно, ако не е нужен)</label><input id="line2" type="text" maxlength="31">
+<div class="status muted"><b>Променливи за въпросите и отговорите</b><br><code>{ДЕН_ОТ_СЕДМИЦАТА}</code> — понеделник и т.н.<br><code>{ДАТА}</code> — число на месеца<br><code>{МЕСЕЦ}</code> — име на месеца<br><code>{ГОДИНА}</code> — година<br><code>{СЛЕДВАЩ_ДЕН}</code> — грешен вариант за въпроса за днешния ден</div>
+<label>Отговор А</label><input id="answerA" type="text" maxlength="31">
+<label>Отговор Б</label><input id="answerB" type="text" maxlength="31">
+<label>Верен отговор</label><div><span class="radio"><input type="radio" name="correct" value="0" id="correctA"><label for="correctA">А</label></span><span class="radio"><input type="radio" name="correct" value="1" id="correctB"><label for="correctB">Б</label></span></div>
+<button id="saveQuestion">Запази въпроса</button><button id="newQuestion">Нов въпрос</button><button id="deleteQuestion" class="danger">Изтрий</button><p id="message" class="muted"></p></div>
+<div class="preview"><b>Преглед на OLED дисплея</b><p><img id="oled" class="oled" src="/preview.bmp" alt="Преглед"></p><p class="muted">А е долу вляво, Б е долу вдясно. За да пренесеш текста, раздели го между ред 1 и ред 2.</p></div></div></section>
+<script>
+const $=id=>document.getElementById(id);let items=[],selected=-1;
+function fields(){return {line1:$('line1').value,line2:$('line2').value,answerA:$('answerA').value,answerB:$('answerB').value,correct:document.querySelector('input[name=correct]:checked')?.value||'0'}}
+function updatePreview(){const f=fields(),q=new URLSearchParams(f);$('oled').src='/preview.bmp?'+q.toString()+'&t='+Date.now()}
+['line1','line2','answerA','answerB'].forEach(id=>$(id).addEventListener('input',updatePreview));document.querySelectorAll('input[name=correct]').forEach(e=>e.addEventListener('change',updatePreview));
+function showItem(i){selected=i;if(i<0){$('line1').value='';$('line2').value='';$('answerA').value='';$('answerB').value='';$('correctA').checked=true}else{const q=items[i];$('line1').value=q.line1;$('line2').value=q.line2;$('answerA').value=q.answerA;$('answerB').value=q.answerB;$('correct'+(q.correct?'B':'A')).checked=true}updatePreview()}
+async function loadQuestions(){items=await (await fetch('/api/questions')).json();const list=$('questionList');list.innerHTML='';items.forEach((q,i)=>{const o=document.createElement('option');o.value=i;o.textContent=(i+1)+'. '+(q.line1||'(празен въпрос)');list.appendChild(o)});if(items.length){selected=Math.min(selected,items.length-1);list.value=selected;showItem(selected)}else showItem(-1)}
+$('questionList').addEventListener('change',e=>showItem(+e.target.value));$('newQuestion').onclick=()=>{$('questionList').value='';showItem(-1);selected=-1;$('message').textContent='Попълни полетата и натисни „Запази въпроса“. '};
+$('saveQuestion').onclick=async()=>{const f=fields();if(!f.line1.trim()&&!f.line2.trim()){alert('Въведи текста на въпроса.');return}if(!f.answerA.trim()||!f.answerB.trim()){alert('Попълни и двата отговора.');return}f.idx=selected;const r=await fetch('/api/save',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:new URLSearchParams(f)});$('message').textContent=await r.text();await loadQuestions()};
+$('deleteQuestion').onclick=async()=>{if(selected<0||!confirm('Да изтрия ли избрания въпрос?'))return;const r=await fetch('/api/delete',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'idx='+selected});$('message').textContent=await r.text();selected=Math.max(0,selected-1);await loadQuestions()};
+$('wifiForm').onsubmit=async e=>{e.preventDefault();const r=await fetch('/api/wifi',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:new URLSearchParams(new FormData(e.target))});$('net').textContent=await r.text()};
+$('wifiNetworks').onchange=()=>{if($('wifiNetworks').value)$('wifiSsid').value=$('wifiNetworks').value};
+$('scanWifi').onclick=async()=>{const button=$('scanWifi'),select=$('wifiNetworks');button.disabled=true;select.innerHTML='<option value="">Сканиране…</option>';try{while(true){const r=await fetch('/api/wifi/scan');const data=await r.json();if(!r.ok)throw new Error(data.error||'Неуспешно сканиране.');if(data.scanning){await new Promise(resolve=>setTimeout(resolve,700));continue}select.innerHTML='<option value="">Избери мрежа…</option>';if(!data.networks.length){select.options[0].textContent='Не са открити мрежи';break}data.networks.forEach(n=>{const option=document.createElement('option');option.value=n.ssid;option.textContent=n.ssid+' ('+n.rssi+' dBm, '+(n.secure?'защитена':'отворена')+')';select.appendChild(option)});break}}catch(error){select.innerHTML='<option value="">Грешка при сканиране</option>';$('net').textContent=error.message}finally{button.disabled=false}};
+async function loadClassSettings(updateFields=true){const r=await fetch('/api/class?scope='+$('statsScope').value);const c=await r.json();if(updateFields){$('students').value=c.students;$('absent').value=c.absent;$('gameMode').value=c.mode;$('pointsToWin').value=c.pointsToWin}$('classMessage').textContent=c.message;const esc=s=>String(s).replace(/[&<>"']/g,ch=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch]));let h='<table class="stats-table"><tr><th>Дете</th><th>Мачове</th><th>Победи</th><th>Верни</th><th>Грешни</th><th>Средно време</th><th>Най-бърз</th></tr>';c.stats.forEach(s=>{h+='<tr><td>'+esc(s.name)+'</td><td>'+s.played+'</td><td>'+s.won+'</td><td>'+s.correct+'</td><td>'+s.wrong+'</td><td>'+s.avg+' сек.</td><td>'+s.fastest+' сек.</td></tr>'});$('statsTable').innerHTML=h+'</table>'}
+$('saveClass').onclick=async()=>{const body=new URLSearchParams({students:$('students').value,absent:$('absent').value,mode:$('gameMode').value,pointsToWin:$('pointsToWin').value});const r=await fetch('/api/class/save',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body});const message=await r.text();if(r.ok)await loadClassSettings(true);$('classMessage').textContent=message};
+$('endTournament').onclick=async()=>{const r=await fetch('/api/tournament/end',{method:'POST'});$('classMessage').textContent=await r.text();await loadClassSettings()};
+$('statsScope').addEventListener('change',()=>loadClassSettings(false));$('resetStatistics').onclick=async()=>{const scope=$('statsScope').value;if(!confirm('Нулиране на статистиката за избрания период?'))return;const r=await fetch('/api/stats/reset',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'scope='+scope});$('classMessage').textContent=await r.text();await loadClassSettings(false)};
+fetch('/api/status').then(r=>r.text()).then(t=>$('net').textContent=t);loadQuestions();loadClassSettings();setInterval(()=>loadClassSettings(false),5000);
+</script></body></html>)rawliteral";
+
+String jsonEscape(const String& input) {
+String out;
+out += (char)34; // opening double quote
+for (size_t i = 0; i < input.length(); i++) {
+char c = input[i];
+if (c == 34 || c == 92) { out += (char)92; out += c; }
+else if (c == 10) { out += (char)92; out += 'n'; }
+else if (c == 13) { out += (char)92; out += 'r'; }
+else if ((uint8_t)c >= 0x20) out += c;
+}
+out += (char)34; // closing double quote
+return out;
+}
+
+void saveQuestionAt(uint8_t index) {
+char key[8];
+snprintf(key, sizeof(key), "q%02ul1", (unsigned long)index); preferences.putString(key, questions[index].line1);
+snprintf(key, sizeof(key), "q%02ul2", (unsigned long)index); preferences.putString(key, questions[index].line2);
+snprintf(key, sizeof(key), "q%02ua", (unsigned long)index); preferences.putString(key, questions[index].answerA);
+snprintf(key, sizeof(key), "q%02ub", (unsigned long)index); preferences.putString(key, questions[index].answerB);
+snprintf(key, sizeof(key), "q%02uc", (unsigned long)index); preferences.putUChar(key, questions[index].correctAnswer);
+}
+
+void persistAllQuestions() {
+preferences.putUChar("count", QUESTION_COUNT);
+for (uint8_t i = 0; i < QUESTION_COUNT; i++) saveQuestionAt(i);
+}
+
+void loadQuestionsFromStorage() {
+preferences.begin("quizcfg", false);
+QUESTION_COUNT = preferences.getUChar("count", 0);
+if (QUESTION_COUNT == 0 || QUESTION_COUNT > MAX_QUESTIONS) {
+QUESTION_COUNT = sizeof(defaultQuestions) / sizeof(defaultQuestions[0]);
+for (uint8_t i = 0; i < QUESTION_COUNT; i++) questions[i] = defaultQuestions[i];
+persistAllQuestions();
+return;
+}
+char key[8];
+for (uint8_t i = 0; i < QUESTION_COUNT; i++) {
+snprintf(key, sizeof(key), "q%02ul1", (unsigned long)i); preferences.getString(key, questions[i].line1, sizeof(questions[i].line1));
+snprintf(key, sizeof(key), "q%02ul2", (unsigned long)i); preferences.getString(key, questions[i].line2, sizeof(questions[i].line2));
+snprintf(key, sizeof(key), "q%02ua", (unsigned long)i); preferences.getString(key, questions[i].answerA, sizeof(questions[i].answerA));
+snprintf(key, sizeof(key), "q%02ub", (unsigned long)i); preferences.getString(key, questions[i].answerB, sizeof(questions[i].answerB));
+snprintf(key, sizeof(key), "q%02uc", (unsigned long)i); questions[i].correctAnswer = preferences.getUChar(key, 0) ? 1 : 0;
+}
+for (uint8_t i = 0; i < QUESTION_COUNT; i++) {
+if (strcmp(questions[i].line1, "Какъв ден е") == 0 &&
+strcmp(questions[i].line2, "днес?") == 0 &&
+strcmp(questions[i].answerA, "Вторник") == 0 &&
+strcmp(questions[i].answerB, "Петък") == 0) {
+strlcpy(questions[i].answerA, "{ДЕН_ОТ_СЕДМИЦАТА}", sizeof(questions[i].answerA));
+strlcpy(questions[i].answerB, "{СЛЕДВАЩ_ДЕН}", sizeof(questions[i].answerB));
+questions[i].correctAnswer = 0;
+saveQuestionAt(i);
+}
+}
+}
+
+bool namesEqual(const char* a, const char* b) {
+return String(a).equalsIgnoreCase(String(b));
+}
+
+bool parseNameCsv(const String& csv, char output[MAX_STUDENTS][32], uint8_t& count) {
+count = 0;
+int start = 0;
+for (int position = 0; position <= (int)csv.length(); position++) {
+bool separator = position == (int)csv.length();
+if (!separator) {
+char c = csv[position];
+separator = c == ',' || c == ';' || c == '\n' || c == '\r';
+}
+if (!separator) continue;
+String name = csv.substring(start, position);
+name.trim();
+if (name.length()) {
+if (name.length() > 31) return false;
+bool duplicate = false;
+for (uint8_t i = 0; i < count; i++) {
+if (namesEqual(output[i], name.c_str())) duplicate = true;
+}
+if (!duplicate) {
+if (count >= MAX_STUDENTS) return false;
+strlcpy(output[count], name.c_str(), sizeof(output[count]));
+count++;
+}
+}
+start = position + 1;
+}
+return true;
+}
+
+int findStatByName(const StudentStats* records, uint8_t count, const char* name) {
+for (uint8_t i = 0; i < count; i++) {
+if (namesEqual(records[i].name, name)) return i;
+}
+return -1;
+}
+
+void saveStudentStats() {
+preferences.putUChar("statCnt", studentCount);
+for (uint8_t i = 0; i < studentCount; i++) {
+strlcpy(studentStats[i].name, studentNames[i], sizeof(studentStats[i].name));
+char key[8];
+snprintf(key, sizeof(key), "st%02u", (unsigned)i);
+preferences.putBytes(key, &studentStats[i], sizeof(StudentStats));
+studentStatsDirty[i] = false;
+}
+}
+
+void saveOneStudentStats(uint8_t index) {
+if (index >= studentCount) return;
+strlcpy(studentStats[index].name, studentNames[index], sizeof(studentStats[index].name));
+char key[8];
+snprintf(key, sizeof(key), "st%02u", (unsigned)index);
+preferences.putBytes(key, &studentStats[index], sizeof(StudentStats));
+studentStatsDirty[index] = false;
+}
+
+void flushStudentStats() {
+for (uint8_t i = 0; i < studentCount; i++) {
+if (studentStatsDirty[i]) saveOneStudentStats(i);
+}
+}
+
+void loadClassSettings() {
+// Keep the large statistics buffer out of the ESP32 setup task stack.
+static StudentStats previous[MAX_STUDENTS];
+memset(previous, 0, sizeof(previous));
+uint8_t previousCount = preferences.getUChar("statCnt", 0);
+if (previousCount > MAX_STUDENTS) previousCount = MAX_STUDENTS;
+for (uint8_t i = 0; i < previousCount; i++) {
+char key[8];
+snprintf(key, sizeof(key), "st%02u", (unsigned)i);
+size_t storedSize = preferences.getBytesLength(key);
+if (storedSize == sizeof(StudentStats)) {
+preferences.getBytes(key, &previous[i], sizeof(StudentStats));
+} else if (storedSize == sizeof(LegacyStudentStats)) {
+LegacyStudentStats legacy = {};
+preferences.getBytes(key, &legacy, sizeof(legacy));
+strlcpy(previous[i].name, legacy.name, sizeof(previous[i].name));
+previous[i].matchesPlayed = legacy.matchesPlayed;
+previous[i].matchesWon = legacy.matchesWon;
+previous[i].correctAnswers = legacy.correctAnswers;
+previous[i].wrongAnswers = legacy.wrongAnswers;
+previous[i].totalCorrectMs = legacy.totalCorrectMs;
+previous[i].fastestCorrectMs = legacy.fastestCorrectMs;
+}
+}
+
+studentsCsv = preferences.getString("students", "");
+absentCsv = preferences.getString("absent", "");
+uint8_t savedMode = preferences.getUChar("gameMode", GAME_MODE_CLASSIC);
+gameMode = savedMode == GAME_MODE_TOURNAMENT ? GAME_MODE_TOURNAMENT : GAME_MODE_CLASSIC;
+uint8_t savedTarget = preferences.getUChar("targetPts", 3);
+tournamentPointsToWin = (savedTarget >= MIN_TOURNAMENT_POINTS_TO_WIN && savedTarget <= MAX_TOURNAMENT_POINTS_TO_WIN)
+? savedTarget : 3;
+
+if (!parseNameCsv(studentsCsv, studentNames, studentCount)) studentCount = 0;
+if (!parseNameCsv(absentCsv, absentNames, absentCount)) absentCount = 0;
+memset(studentStats, 0, sizeof(studentStats));
+memset(sessionMatchWins, 0, sizeof(sessionMatchWins));
+memset(sessionMatchesPlayed, 0, sizeof(sessionMatchesPlayed));
+memset(sessionCorrectAnswers, 0, sizeof(sessionCorrectAnswers));
+memset(sessionCorrectMs, 0, sizeof(sessionCorrectMs));
+for (uint8_t i = 0; i < studentCount; i++) {
+int oldIndex = findStatByName(previous, previousCount, studentNames[i]);
+if (oldIndex >= 0) studentStats[i] = previous[oldIndex];
+strlcpy(studentStats[i].name, studentNames[i], sizeof(studentStats[i].name));
+}
+saveStudentStats();
+}
+
+uint8_t getPresentStudents(uint8_t* output) {
+uint8_t count = 0;
+for (uint8_t i = 0; i < studentCount; i++) {
+bool absent = false;
+for (uint8_t j = 0; j < absentCount; j++) {
+if (namesEqual(studentNames[i], absentNames[j])) absent = true;
+}
+if (!absent) output[count++] = i;
+}
+return count;
+}
+
+int32_t periodWindowKey(uint8_t scope) {
+if (scope == STATS_SCOPE_GAME) return -2;
+struct tm now;
+if (!getLocalDateTime(now)) return -1;
+int32_t todayKey = (int32_t)(now.tm_year + 1900) * 400 + now.tm_yday;
+if (scope == STATS_SCOPE_HOUR) return todayKey * 24 + now.tm_hour;
+if (scope == STATS_SCOPE_DAY) return todayKey;
+if (scope == STATS_SCOPE_WEEK) {
+struct tm monday = now;
+monday.tm_mday -= (monday.tm_wday + 6) % 7;
+monday.tm_hour = 0;
+monday.tm_min = 0;
+monday.tm_sec = 0;
+time_t mondayTime = mktime(&monday);
+struct tm mondayLocal;
+if (mondayTime != (time_t)-1 && localtime_r(&mondayTime, &mondayLocal)) {
+return (int32_t)(mondayLocal.tm_year + 1900) * 400 + mondayLocal.tm_yday;
+}
+return todayKey;
+}
+return -3;
+}
+
+bool ensurePeriodWindow(PeriodStats& period, uint8_t scope) {
+int32_t key = periodWindowKey(scope);
+if (period.windowKey == key) return false;
+period = PeriodStats();
+period.windowKey = key;
+return true;
+}
+
+void clearPeriodWindow(PeriodStats& period, uint8_t scope) {
+period = PeriodStats();
+period.windowKey = periodWindowKey(scope);
+}
+
+PeriodStats* getStudentPeriod(StudentStats& student, uint8_t scope) {
+if (scope == STATS_SCOPE_GAME) return &student.game;
+if (scope == STATS_SCOPE_HOUR) return &student.hour;
+if (scope == STATS_SCOPE_DAY) return &student.day;
+if (scope == STATS_SCOPE_WEEK) return &student.week;
+return nullptr;
+}
+
+void addPeriodMatchPlayed(PeriodStats& period, uint8_t scope) {
+ensurePeriodWindow(period, scope);
+period.matchesPlayed++;
+}
+
+void addPeriodMatchWon(PeriodStats& period, uint8_t scope) {
+ensurePeriodWindow(period, scope);
+period.matchesWon++;
+}
+
+void addPeriodAnswer(PeriodStats& period, uint8_t scope, bool correct, uint32_t responseMs) {
+ensurePeriodWindow(period, scope);
+if (!correct) {
+period.wrongAnswers++;
+return;
+}
+period.correctAnswers++;
+period.totalCorrectMs += responseMs;
+if (!period.fastestCorrectMs || responseMs < period.fastestCorrectMs) {
+period.fastestCorrectMs = responseMs ? responseMs : 1;
+}
+}
+
+void recordStudentMatchPlayed(uint8_t index) {
+if (index >= studentCount) return;
+StudentStats& stats = studentStats[index];
+stats.matchesPlayed++;
+addPeriodMatchPlayed(stats.game, STATS_SCOPE_GAME);
+addPeriodMatchPlayed(stats.hour, STATS_SCOPE_HOUR);
+addPeriodMatchPlayed(stats.day, STATS_SCOPE_DAY);
+addPeriodMatchPlayed(stats.week, STATS_SCOPE_WEEK);
+studentStatsDirty[index] = true;
+}
+
+void recordStudentMatchWon(uint8_t index) {
+if (index >= studentCount) return;
+StudentStats& stats = studentStats[index];
+stats.matchesWon++;
+addPeriodMatchWon(stats.game, STATS_SCOPE_GAME);
+addPeriodMatchWon(stats.hour, STATS_SCOPE_HOUR);
+addPeriodMatchWon(stats.day, STATS_SCOPE_DAY);
+addPeriodMatchWon(stats.week, STATS_SCOPE_WEEK);
+studentStatsDirty[index] = true;
+}
+
+void recordStudentAnswer(uint8_t index, bool correct, uint32_t responseMs) {
+if (index >= studentCount) return;
+StudentStats& stats = studentStats[index];
+if (correct) {
+stats.correctAnswers++;
+stats.totalCorrectMs += responseMs;
+if (!stats.fastestCorrectMs || responseMs < stats.fastestCorrectMs) {
+stats.fastestCorrectMs = responseMs ? responseMs : 1;
+}
+} else {
+stats.wrongAnswers++;
+}
+addPeriodAnswer(stats.game, STATS_SCOPE_GAME, correct, responseMs);
+addPeriodAnswer(stats.hour, STATS_SCOPE_HOUR, correct, responseMs);
+addPeriodAnswer(stats.day, STATS_SCOPE_DAY, correct, responseMs);
+addPeriodAnswer(stats.week, STATS_SCOPE_WEEK, correct, responseMs);
+studentStatsDirty[index] = true;
+}
+
+PeriodStats statsForScope(const StudentStats& student, uint8_t scope) {
+if (scope == STATS_SCOPE_GAME) return student.game;
+if (scope == STATS_SCOPE_HOUR) return student.hour;
+if (scope == STATS_SCOPE_DAY) return student.day;
+if (scope == STATS_SCOPE_WEEK) return student.week;
+PeriodStats all = {};
+all.matchesPlayed = student.matchesPlayed;
+all.matchesWon = student.matchesWon;
+all.correctAnswers = student.correctAnswers;
+all.wrongAnswers = student.wrongAnswers;
+all.totalCorrectMs = student.totalCorrectMs;
+all.fastestCorrectMs = student.fastestCorrectMs;
+return all;
+}
+
+void sendClassData(uint8_t scope) {
+if (scope < STATS_SCOPE_GAME || scope > STATS_SCOPE_ALL) scope = STATS_SCOPE_GAME;
+uint8_t present[MAX_STUDENTS];
+uint8_t presentCount = getPresentStudents(present);
+String json = "{";
+json += (char)34; json += "students"; json += (char)34; json += ':'; json += jsonEscape(studentsCsv); json += ',';
+json += (char)34; json += "absent"; json += (char)34; json += ':'; json += jsonEscape(absentCsv); json += ',';
+json += (char)34; json += "mode"; json += (char)34; json += ':'; json += String(gameMode); json += ',';
+json += (char)34; json += "pointsToWin"; json += (char)34; json += ':'; json += String(tournamentPointsToWin); json += ',';
+json += (char)34; json += "active"; json += (char)34; json += ':'; json += (tournamentActive ? "true" : "false"); json += ',';
+json += (char)34; json += "presentCount"; json += (char)34; json += ':'; json += String(presentCount); json += ',';
+json += (char)34; json += "message"; json += (char)34; json += ':';
+String message;
+if (tournamentActive && activeStudent[0] >= 0 && activeStudent[1] >= 0) {
+if (tournamentReadyPhase) {
+message = "Чакаме и двете деца да натиснат Да: ";
+message += studentNames[(uint8_t)activeStudent[0]];
+message += " и ";
+message += studentNames[(uint8_t)activeStudent[1]];
+} else {
+message = "Надпреварата тече. Текущ мач: ";
+message += studentNames[(uint8_t)activeStudent[0]];
+message += " срещу ";
+message += studentNames[(uint8_t)activeStudent[1]];
+message += " (";
+message += String(scores[0]);
+message += " - ";
+message += String(scores[1]);
+message += "). Първи до ";
+message += String(tournamentPointsToWin);
+message += " точки печели.";
+}
+message += " Присъстват ";
+message += String(presentCount);
+message += " деца; другите се включват в следващи мачове.";
+} else {
+message = "Присъстващи деца: ";
+message += String(presentCount);
+message += ".";
+}
+json += jsonEscape(message); json += ',';
+json += (char)34; json += "stats"; json += (char)34; json += ":[";
+for (uint8_t i = 0; i < studentCount; i++) {
+if (i) json += ',';
+if (scope != STATS_SCOPE_ALL) {
+PeriodStats* period = getStudentPeriod(studentStats[i], scope);
+if (period && ensurePeriodWindow(*period, scope)) saveOneStudentStats(i);
+}
+PeriodStats view = statsForScope(studentStats[i], scope);
+json += '{';
+json += (char)34; json += "name"; json += (char)34; json += ':'; json += jsonEscape(studentNames[i]); json += ',';
+json += (char)34; json += "played"; json += (char)34; json += ':'; json += String(view.matchesPlayed); json += ',';
+json += (char)34; json += "won"; json += (char)34; json += ':'; json += String(view.matchesWon); json += ',';
+json += (char)34; json += "correct"; json += (char)34; json += ':'; json += String(view.correctAnswers); json += ',';
+json += (char)34; json += "wrong"; json += (char)34; json += ':'; json += String(view.wrongAnswers); json += ',';
+json += (char)34; json += "avg"; json += (char)34; json += ':';
+float average = view.correctAnswers ? (float)view.totalCorrectMs / view.correctAnswers / 1000.0f : 0.0f;
+json += String(average, 1); json += ',';
+json += (char)34; json += "fastest"; json += (char)34; json += ':';
+json += String(view.fastestCorrectMs ? view.fastestCorrectMs / 1000.0f : 0.0f, 1);
+json += '}';
+}
+json += "]}";
+webServer.send(200, "application/json; charset=utf-8", json);
+}
+
+void saveClassSettings() {
+// These buffers total several kilobytes; keep them in static RAM instead of
+// overflowing the ESP32 loop task stack while handling the web request.
+static char newStudents[MAX_STUDENTS][32];
+static char newAbsents[MAX_STUDENTS][32];
+static StudentStats oldStats[MAX_STUDENTS];
+memset(newStudents, 0, sizeof(newStudents));
+memset(newAbsents, 0, sizeof(newAbsents));
+memset(oldStats, 0, sizeof(oldStats));
+uint8_t newStudentCount = 0, newAbsentCount = 0;
+String incomingStudents = webServer.arg("students");
+String incomingAbsent = webServer.arg("absent");
+uint8_t newPointsToWin = tournamentPointsToWin;
+String pointsInput = webServer.arg("pointsToWin");
+if (pointsInput.length() > 0) {
+long parsedPoints = pointsInput.toInt();
+if (parsedPoints < MIN_TOURNAMENT_POINTS_TO_WIN || parsedPoints > MAX_TOURNAMENT_POINTS_TO_WIN) {
+webServer.send(400, "text/plain; charset=utf-8", "Точките за победа трябва да са между 1 и 20.");
+return;
+}
+newPointsToWin = (uint8_t)parsedPoints;
+}
+if (!parseNameCsv(incomingStudents, newStudents, newStudentCount) ||
+!parseNameCsv(incomingAbsent, newAbsents, newAbsentCount)) {
+webServer.send(400, "text/plain; charset=utf-8", "Имената трябва да са до 31 байта и максимум 32 деца.");
+return;
+}
+
+memcpy(oldStats, studentStats, sizeof(oldStats));
+uint8_t oldCount = studentCount;
+memset(studentStats, 0, sizeof(studentStats));
+memset(studentStatsDirty, 0, sizeof(studentStatsDirty));
+memcpy(studentNames, newStudents, sizeof(studentNames));
+memcpy(absentNames, newAbsents, sizeof(absentNames));
+studentCount = newStudentCount;
+absentCount = newAbsentCount;
+studentsCsv = "";
+for (uint8_t i = 0; i < studentCount; i++) {
+if (i) studentsCsv += ", ";
+studentsCsv += studentNames[i];
+}
+absentCsv = "";
+for (uint8_t i = 0; i < absentCount; i++) {
+if (i) absentCsv += ", ";
+absentCsv += absentNames[i];
+}
+uint8_t requestedMode = webServer.arg("mode").toInt();
+gameMode = requestedMode == GAME_MODE_TOURNAMENT ? GAME_MODE_TOURNAMENT : GAME_MODE_CLASSIC;
+tournamentPointsToWin = newPointsToWin;
+
+for (uint8_t i = 0; i < studentCount; i++) {
+int oldIndex = findStatByName(oldStats, oldCount, studentNames[i]);
+if (oldIndex >= 0) studentStats[i] = oldStats[oldIndex];
+strlcpy(studentStats[i].name, studentNames[i], sizeof(studentStats[i].name));
+}
+preferences.putString("students", studentsCsv);
+preferences.putString("absent", absentCsv);
+if (preferences.getString("students", "") != studentsCsv ||
+preferences.getString("absent", "") != absentCsv) {
+webServer.send(500, "text/plain; charset=utf-8", "ESP32 не успя да запази списъка в паметта. Освободи място или съкрати списъка и опитай отново.");
+return;
+}
+preferences.putUChar("gameMode", gameMode);
+preferences.putUChar("targetPts", tournamentPointsToWin);
+tournamentActive = false;
+tournamentReadyPhase = false;
+readyForMatch[0] = readyForMatch[1] = false;
+choosingOtherPlayer[0] = choosingOtherPlayer[1] = false;
+activeStudent[0] = activeStudent[1] = -1;
+screensaverActive = false;
+lastButtonActivityAt = millis();
+tournamentOrderCount = tournamentOrderPosition = 0;
+saveStudentStats();
+scores[0] = scores[1] = 0;
+currentQuestion = -1;
+if (gameMode == GAME_MODE_TOURNAMENT) {
+if (startTournament()) {
+String result = "Записани са ";
+result += String(studentCount);
+result += " деца; присъстват ";
+uint8_t present[MAX_STUDENTS];
+uint8_t presentCount = getPresentStudents(present);
+result += String(presentCount);
+result += ", отсъстващи/изключени: ";
+result += String(studentCount - presentCount);
+result += ". Първи мач: ";
+result += studentNames[(uint8_t)activeStudent[0]];
+result += " срещу ";
+result += studentNames[(uint8_t)activeStudent[1]];
+result += ". Останалите ще се включват след края на всеки мач. Натиснете „Да“ на двата джойстика.";
+webServer.send(200, "text/plain; charset=utf-8", result);
+return;
+}
+showTournamentIdle();
+uint8_t present[MAX_STUDENTS];
+String result = "Записани са ";
+result += String(studentCount);
+result += " деца; присъстват ";
+uint8_t presentCount = getPresentStudents(present);
+result += String(presentCount);
+result += ", отсъстващи/изключени: ";
+result += String(studentCount - presentCount);
+result += ". За надпревара са нужни поне две присъстващи деца и два работещи дисплея.";
+webServer.send(200, "text/plain; charset=utf-8", result);
+return;
+}
+startNewRound();
+String result = "Настройките са запазени. Деца в списъка: ";
+result += String(studentCount);
+webServer.send(200, "text/plain; charset=utf-8", result);
+}
+
+void sendQuestionList() {
+String json = "[";
+for (uint8_t i = 0; i < QUESTION_COUNT; i++) {
+if (i) json += ',';
+json += '{';
+json += (char)34; json += "line1"; json += (char)34; json += ':'; json += jsonEscape(questions[i].line1); json += ',';
+json += (char)34; json += "line2"; json += (char)34; json += ':'; json += jsonEscape(questions[i].line2); json += ',';
+json += (char)34; json += "answerA"; json += (char)34; json += ':'; json += jsonEscape(questions[i].answerA); json += ',';
+json += (char)34; json += "answerB"; json += (char)34; json += ':'; json += jsonEscape(questions[i].answerB); json += ',';
+json += (char)34; json += "correct"; json += (char)34; json += ':'; json += String(questions[i].correctAnswer);
+json += '}';
+}
+json += ']';
+webServer.send(200, "application/json; charset=utf-8", json);
+}
+
+void writeLittleEndian16(uint8_t* buffer, uint16_t offset, uint16_t value) {
+buffer[offset] = value & 0xff;
+buffer[offset + 1] = (value >> 8) & 0xff;
+}
+
+void writeLittleEndian32(uint8_t* buffer, uint16_t offset, uint32_t value) {
+buffer[offset] = value & 0xff;
+buffer[offset + 1] = (value >> 8) & 0xff;
+buffer[offset + 2] = (value >> 16) & 0xff;
+buffer[offset + 3] = (value >> 24) & 0xff;
+}
+
+void sendPreviewBmp() {
+String l1 = expandTemplate(webServer.arg("line1"));
+String l2 = expandTemplate(webServer.arg("line2"));
+String a = expandTemplate(webServer.arg("answerA"));
+String b = expandTemplate(webServer.arg("answerB"));
+// Use exactly the same drawing code, fonts, separator and OLED 1 offset as the game.
+drawQuestionCore(previewCanvas, previewFont, l1.c_str(), l2.c_str(), a.c_str(), b.c_str(), DISPLAY1_VERTICAL_OFFSET_Y);
+static uint8_t bmp[62 + 128 * 64 / 8];
+memset(bmp, 0, sizeof(bmp));
+bmp[0] = 'B'; bmp[1] = 'M';
+writeLittleEndian32(bmp, 2, sizeof(bmp));
+writeLittleEndian32(bmp, 10, 62);
+writeLittleEndian32(bmp, 14, 40);
+writeLittleEndian32(bmp, 18, 128);
+writeLittleEndian32(bmp, 22, 64);
+writeLittleEndian16(bmp, 26, 1);
+writeLittleEndian16(bmp, 28, 1);
+writeLittleEndian32(bmp, 34, 1024);
+writeLittleEndian32(bmp, 46, 2);
+// 1-bit BMP palette: black then white, BGRA entries.
+bmp[58] = bmp[59] = bmp[60] = 255;
+for (uint8_t row = 0; row < 64; row++) {
+int16_t y = 63 - row;
+for (uint8_t x = 0; x < 128; x++) {
+if (previewCanvas.getPixel(x, y)) bmp[62 + row * 16 + x / 8] |= (0x80 >> (x & 7));
+}
+}
+webServer.setContentLength(sizeof(bmp));
+webServer.send(200, "image/bmp", "");
+webServer.sendContent((const char*)bmp, sizeof(bmp));
+}
+
+void handleSaveQuestion() {
+int index = webServer.arg("idx").toInt();
+bool isNew = index < 0 || index >= QUESTION_COUNT;
+String line1 = webServer.arg("line1"), line2 = webServer.arg("line2");
+String answerA = webServer.arg("answerA"), answerB = webServer.arg("answerB");
+if ((!line1.length() && !line2.length()) || !answerA.length() || !answerB.length()) {
+webServer.send(400, "text/plain; charset=utf-8", "Попълни въпроса и двата отговора."); return;
+}
+if (line1.length() > 63 || line2.length() > 63 || answerA.length() > 63 || answerB.length() > 63) {
+webServer.send(400, "text/plain; charset=utf-8", "Всяко поле може да съдържа до 31 символа (63 байта за кирилица)."); return;
+}
+if (isNew && QUESTION_COUNT >= MAX_QUESTIONS) { webServer.send(400, "text/plain; charset=utf-8", "Достигнат е лимитът от 24 въпроса."); return; }
+if (isNew) index = QUESTION_COUNT++;
+strlcpy(questions[index].line1, line1.c_str(), sizeof(questions[index].line1));
+strlcpy(questions[index].line2, line2.c_str(), sizeof(questions[index].line2));
+strlcpy(questions[index].answerA, answerA.c_str(), sizeof(questions[index].answerA));
+strlcpy(questions[index].answerB, answerB.c_str(), sizeof(questions[index].answerB));
+questions[index].correctAnswer = webServer.arg("correct").toInt() == 1 ? 1 : 0;
+persistAllQuestions();
+currentQuestion = -1;
+startNewRound();
+webServer.send(200, "text/plain; charset=utf-8", "Запазено. Въпросите се пазят в ESP32.");
+}
+
+void handleDeleteQuestion() {
+int index = webServer.arg("idx").toInt();
+if (index < 0 || index >= QUESTION_COUNT || QUESTION_COUNT <= 1) { webServer.send(400, "text/plain; charset=utf-8", "Трябва да остане поне един въпрос."); return; }
+for (int i = index; i < QUESTION_COUNT - 1; i++) questions[i] = questions[i + 1];
+QUESTION_COUNT--;
+persistAllQuestions();
+currentQuestion = -1;
+startNewRound();
+webServer.send(200, "text/plain; charset=utf-8", "Въпросът е изтрит.");
+}
+
+void handleSaveWifi() {
+String ssid = webServer.arg("ssid"), password = webServer.arg("password");
+if (ssid.length() == 0 || ssid.length() > 32 || password.length() > 63) { webServer.send(400, "text/plain; charset=utf-8", "Невалидно име или парола."); return; }
+preferences.putString("wifi_ssid", ssid);
+preferences.putString("wifi_pass", password);
+webServer.send(200, "text/plain; charset=utf-8", "Wi-Fi настройките са запазени. ESP32 ще се рестартира след 2 секунди.");
+delay(2000);
+esp_restart();
+}
+
+void handleWifiScan() {
+static bool scanInProgress = false;
+if (!scanInProgress) {
+int16_t started = WiFi.scanNetworks(true, true);
+if (started < 0 && started != WIFI_SCAN_RUNNING) {
+WiFi.scanDelete();
+webServer.send(500, "application/json; charset=utf-8", R"json({"scanning":false,"error":"ESP32 не успя да започне сканирането. Опитай отново."})json");
+return;
+}
+scanInProgress = true;
+}
+
+int16_t networkCount = WiFi.scanComplete();
+if (networkCount == WIFI_SCAN_RUNNING) {
+webServer.send(200, "application/json; charset=utf-8", R"json({"scanning":true})json");
+return;
+}
+if (networkCount == WIFI_SCAN_FAILED) {
+scanInProgress = false;
+WiFi.scanDelete();
+webServer.send(500, "application/json; charset=utf-8", R"json({"scanning":false,"error":"Сканирането не завърши. Опитай отново."})json");
+return;
+}
+
+String json = "{";
+json += (char)34; json += "scanning"; json += (char)34; json += ":false,";
+json += (char)34; json += "networks"; json += (char)34; json += ":[";
+bool firstNetwork = true;
+for (int16_t i = 0; i < networkCount; i++) {
+String ssid = WiFi.SSID(i);
+if (!ssid.length()) continue;
+if (!firstNetwork) json += ',';
+firstNetwork = false;
+json += '{';
+json += (char)34; json += "ssid"; json += (char)34; json += ':';
+json += jsonEscape(ssid);
+json += ',';
+json += (char)34; json += "rssi"; json += (char)34; json += ':';
+json += String(WiFi.RSSI(i));
+json += ',';
+json += (char)34; json += "channel"; json += (char)34; json += ':';
+json += String(WiFi.channel(i));
+json += ',';
+json += (char)34; json += "secure"; json += (char)34; json += ':';
+json += WiFi.encryptionType(i) == WIFI_AUTH_OPEN ? "false" : "true";
+json += '}';
+}
+json += "]}";
+scanInProgress = false;
+WiFi.scanDelete();
+webServer.send(200, "application/json; charset=utf-8", json);
+}
+
+void handleRootPage() {
+webServer.send_P(200, "text/html; charset=utf-8", INDEX_HTML);
+}
+
+void handleStatusPage() {
+String text = "Мрежа за настройка: ";
+text += SETUP_WIFI_SSID;
+text += "\nIP за настройка: http://192.168.4.1\n";
+if (WiFi.status() == WL_CONNECTED) {
+text += "Домашна Wi-Fi мрежа: ";
+text += WiFi.SSID();
+text += "\nIP адрес: http://";
+text += WiFi.localIP().toString();
+text += "\n";
+} else {
+text += "Домашна Wi-Fi мрежа: няма връзка\nIP адрес: няма\n";
+}
+struct tm now;
+text += getLocalDateTime(now) ? "Часът е синхронизиран." : "Часът още не е синхронизиран с интернет.";
+webServer.send(200, "text/plain; charset=utf-8", text);
+}
+
+void handleClassData() {
+uint8_t scope = webServer.arg("scope").toInt();
+sendClassData(scope);
+}
+
+void handleSaveClassSettings() {
+saveClassSettings();
+}
+
+void handleEndTournament() {
+if (!tournamentActive) {
+webServer.send(200, "text/plain; charset=utf-8", "В момента няма активна надпревара.");
+return;
+}
+finishTournament();
+webServer.send(200, "text/plain; charset=utf-8", "Надпреварата е приключила; резултатът е показан на дисплеите.");
+}
+
+void handleResetStatistics() {
+uint8_t scope = webServer.arg("scope").toInt();
+if (scope < STATS_SCOPE_GAME || scope > STATS_SCOPE_ALL) {
+webServer.send(400, "text/plain; charset=utf-8", "Невалиден период.");
+return;
+}
+
+for (uint8_t i = 0; i < studentCount; i++) {
+StudentStats& stats = studentStats[i];
+if (scope == STATS_SCOPE_GAME) {
+clearPeriodWindow(stats.game, STATS_SCOPE_GAME);
+} else if (scope == STATS_SCOPE_HOUR) {
+clearPeriodWindow(stats.hour, STATS_SCOPE_HOUR);
+} else if (scope == STATS_SCOPE_DAY) {
+clearPeriodWindow(stats.day, STATS_SCOPE_DAY);
+} else if (scope == STATS_SCOPE_WEEK) {
+clearPeriodWindow(stats.week, STATS_SCOPE_WEEK);
+} else {
+char savedName[sizeof(stats.name)];
+strlcpy(savedName, stats.name, sizeof(savedName));
+stats = StudentStats();
+strlcpy(stats.name, savedName, sizeof(stats.name));
+clearPeriodWindow(stats.game, STATS_SCOPE_GAME);
+clearPeriodWindow(stats.hour, STATS_SCOPE_HOUR);
+clearPeriodWindow(stats.day, STATS_SCOPE_DAY);
+clearPeriodWindow(stats.week, STATS_SCOPE_WEEK);
+}
+studentStatsDirty[i] = true;
+}
+
+const char* response = "Статистиката за избрания период е нулирана.";
+if (scope == STATS_SCOPE_GAME || scope == STATS_SCOPE_ALL) {
+memset(sessionMatchWins, 0, sizeof(sessionMatchWins));
+memset(sessionMatchesPlayed, 0, sizeof(sessionMatchesPlayed));
+memset(sessionCorrectAnswers, 0, sizeof(sessionCorrectAnswers));
+memset(sessionCorrectMs, 0, sizeof(sessionCorrectMs));
+sessionMatchCount = 0;
+scores[0] = scores[1] = 0;
+if (tournamentActive && activeStudent[0] >= 0 && activeStudent[1] >= 0) {
+readyForMatch[0] = readyForMatch[1] = false;
+choosingOtherPlayer[0] = choosingOtherPlayer[1] = false;
+tournamentReadyPhase = true;
+synchronizeButtonStates();
+showReadyPrompt(0);
+showReadyPrompt(1);
+response = scope == STATS_SCOPE_ALL
+? "Всички резултати и статистика са нулирани. Текущият мач започва отначало след потвърждение от двете деца."
+: "Резултатът от текущата надпревара е нулиран. Двете деца трябва да потвърдят готовност отново.";
+} else {
+response = scope == STATS_SCOPE_ALL
+? "Всички резултати и статистика са нулирани."
+: "Резултатът от последната игра и статистиката са нулирани.";
+}
+}
+
+saveStudentStats();
+webServer.send(200, "text/plain; charset=utf-8", response);
+}
+
+void startWebInterface() {
+WiFi.mode(WIFI_AP_STA);
+WiFi.setAutoReconnect(true);
+bool apStarted = WiFi.softAP(SETUP_WIFI_SSID, SETUP_WIFI_PASSWORD);
+Serial.printf("Setup Wi-Fi %s; страница: http://192.168.4.1\n", apStarted ? "готова" : "не стартира");
+String savedSsid = preferences.getString("wifi_ssid", "");
+String savedPassword = preferences.getString("wifi_pass", "");
+if (savedSsid.length()) {
+WiFi.begin(savedSsid.c_str(), savedPassword.c_str());
+Serial.printf("Свързване към домашна Wi-Fi мрежа: %s\n", savedSsid.c_str());
+}
+// Bulgaria time zone, including automatic daylight-saving changes.
+configTzTime("EET-2EEST,M3.5.0/3,M10.5.0/4", "pool.ntp.org", "time.google.com", "time.nist.gov");
+webServer.on("/", HTTP_GET, handleRootPage);
+webServer.on("/api/status", HTTP_GET, handleStatusPage);
+webServer.on("/api/questions", HTTP_GET, sendQuestionList);
+webServer.on("/api/class", HTTP_GET, handleClassData);
+webServer.on("/api/class/save", HTTP_POST, handleSaveClassSettings);
+webServer.on("/api/tournament/end", HTTP_POST, handleEndTournament);
+webServer.on("/api/stats/reset", HTTP_POST, handleResetStatistics);
+webServer.on("/preview.bmp", HTTP_GET, sendPreviewBmp);
+webServer.on("/api/save", HTTP_POST, handleSaveQuestion);
+webServer.on("/api/delete", HTTP_POST, handleDeleteQuestion);
+webServer.on("/api/wifi", HTTP_POST, handleSaveWifi);
+webServer.on("/api/wifi/scan", HTTP_GET, handleWifiScan);
+webServer.begin();
+}
+
+const uint8_t* questionFontForSize(int size) {
+if (size <= 1) return u8g2_font_6x13B_t_cyrillic;
+if (size == 2) return u8g2_font_8x13_t_cyrillic;
+return u8g2_font_9x15_t_cyrillic;
+}
+
+const uint8_t* answerFontForSize(int size) {
+if (size <= 1) return u8g2_font_5x8_t_cyrillic;
+if (size == 2) return u8g2_font_6x12_t_cyrillic;
+return u8g2_font_9x15_t_cyrillic;
+}
+
+void drawCenteredQuestionLine(U8G2_FOR_ADAFRUIT_GFX& font,
+const char* text, int16_t baseline) {
+int16_t width = font.getUTF8Width(text);
+int16_t x = (128 - width) / 2;
+if (x < 0) x = 0;
+
+// Draw once for a clean, readable character shape.
+font.drawUTF8(x, baseline, text);
+}
+
+void drawAnswerOptions(U8G2_FOR_ADAFRUIT_GFX& font,
+const char* answerA, const char* answerB,
+int16_t offsetY) {
+char textA[128];
+char textB[128];
+bool hasAnswerB = answerB && answerB[0] != '\0';
+snprintf(textA, sizeof(textA), "A: %s", answerA);
+if (hasAnswerB) snprintf(textB, sizeof(textB), "Б: %s", answerB);
+else textB[0] = '\0';
+
+int size = ANSWER_FONT_SIZE;
+font.setFont(answerFontForSize(size));
+
+int16_t widthA = font.getUTF8Width(textA);
+int16_t widthB = hasAnswerB ? font.getUTF8Width(textB) : 0;
+
+// Keep the requested size unless both choices would overlap.
+while (hasAnswerB && size > 1 && widthA + widthB + 6 > 128) {
+size--;
+font.setFont(answerFontForSize(size));
+widthA = font.getUTF8Width(textA);
+widthB = font.getUTF8Width(textB);
+}
+
+font.drawUTF8(0, displayTextY(61, offsetY), textA); // A is flush left
+if (hasAnswerB) font.drawUTF8(128 - widthB, displayTextY(61, offsetY), textB); // B is flush right
+}
+
+void drawQuestionCore(Adafruit_GFX& canvas,
+U8G2_FOR_ADAFRUIT_GFX& font,
+const char* line1, const char* line2,
+const char* answerA, const char* answerB,
+int16_t offsetY) {
+canvas.fillScreen(0);
+
+int size = QUESTION_FONT_SIZE;
+font.setFont(questionFontForSize(size));
+int16_t width1 = font.getUTF8Width(line1);
+int16_t width2 = font.getUTF8Width(line2);
+
+while (size > 1 && (width1 > 126 || width2 > 126)) {
+size--;
+font.setFont(questionFontForSize(size));
+width1 = font.getUTF8Width(line1);
+width2 = font.getUTF8Width(line2);
+}
+
+font.setFontMode(1);
+font.setForegroundColor(1);
+
+int16_t ascent = font.getFontAscent();
+int16_t height = ascent - font.getFontDescent();
+int16_t lineCount = (line2[0] == '\0') ? 1 : 2;
+int16_t totalHeight = lineCount * height + (lineCount - 1) * 2;
+int16_t top = (40 - totalHeight) / 2;
+if (top < 0) top = 0;
+
+drawCenteredQuestionLine(font, line1,
+displayTextY(top + ascent, offsetY));
+if (lineCount == 2) {
+drawCenteredQuestionLine(font, line2,
+displayTextY(top + ascent + height + 2, offsetY));
+}
+
+if (SHOW_SEPARATOR_LINE) {
+for (uint8_t i = 0; i < SEPARATOR_LINE_THICKNESS; i++) {
+canvas.drawFastHLine(0, displayTextY(43 + i, offsetY), 128, 1);
+}
+}
+
+drawAnswerOptions(font, answerA, answerB, offsetY);
+}
+
+void drawQuestion(Adafruit_SH1106G& display, U8G2_FOR_ADAFRUIT_GFX& font,
+const char* line1, const char* line2,
+const char* answerA, const char* answerB) {
+int16_t offsetY = (&display == &display1) ? DISPLAY1_VERTICAL_OFFSET_Y : 0;
+drawQuestionCore(display, font, line1, line2, answerA, answerB, offsetY);
+display.display();
+}
+
+void drawMessageCore(Adafruit_GFX& canvas, U8G2_FOR_ADAFRUIT_GFX& font,
+const char* line1, const char* line2,
+const char* line3, const char* line4,
+int16_t offsetY) {
+canvas.fillScreen(0);
+font.setFont(u8g2_font_6x13B_t_cyrillic);
+font.setFontMode(1);
+font.setForegroundColor(1);
+
+if (line1[0]) font.drawUTF8(0, displayTextY(15, offsetY), line1);
+if (line2[0]) font.drawUTF8(0, displayTextY(31, offsetY), line2);
+if (line3[0]) font.drawUTF8(0, displayTextY(47, offsetY), line3);
+if (line4[0]) font.drawUTF8(0, displayTextY(63, offsetY), line4);
+}
+
+void drawMessage(Adafruit_SH1106G& display, U8G2_FOR_ADAFRUIT_GFX& font,
+const char* line1, const char* line2,
+const char* line3, const char* line4) {
+int16_t offsetY = (&display == &display1) ? DISPLAY1_VERTICAL_OFFSET_Y : 0;
+drawMessageCore(display, font, line1, line2, line3, line4, offsetY);
+display.display();
+}
+
+void showTournamentIdle() {
+if (displayAvailable[0]) drawMessage(display1, font1, "НАДПРЕВАРА", "Настрой класа", "в уеб панела", "и запази");
+if (displayAvailable[1]) drawMessage(display2, font2, "НАДПРЕВАРА", "Настрой класа", "в уеб панела", "и запази");
+}
+
+void shuffleTournamentOrder() {
+uint8_t present[MAX_STUDENTS];
+tournamentOrderCount = getPresentStudents(present);
+tournamentOrderPosition = 0;
+for (uint8_t i = 0; i < tournamentOrderCount; i++) tournamentOrder[i] = present[i];
+for (int i = tournamentOrderCount - 1; i > 0; i--) {
+int j = random(i + 1);
+uint8_t temp = tournamentOrder[i];
+tournamentOrder[i] = tournamentOrder[j];
+tournamentOrder[j] = temp;
+}
+}
+
+bool startTournament() {
+if (gameMode != GAME_MODE_TOURNAMENT || !displayAvailable[0] || !displayAvailable[1]) return false;
+uint8_t present[MAX_STUDENTS];
+if (getPresentStudents(present) < 2) return false;
+
+memset(sessionMatchWins, 0, sizeof(sessionMatchWins));
+memset(sessionMatchesPlayed, 0, sizeof(sessionMatchesPlayed));
+memset(sessionCorrectAnswers, 0, sizeof(sessionCorrectAnswers));
+memset(sessionCorrectMs, 0, sizeof(sessionCorrectMs));
+memset(studentStatsDirty, 0, sizeof(studentStatsDirty));
+for (uint8_t i = 0; i < studentCount; i++) clearPeriodWindow(studentStats[i].game, STATS_SCOPE_GAME);
+saveStudentStats();
+sessionMatchCount = 0;
+tournamentActive = true;
+tournamentReadyPhase = false;
+readyForMatch[0] = readyForMatch[1] = false;
+choosingOtherPlayer[0] = choosingOtherPlayer[1] = false;
+tournamentOrderCount = tournamentOrderPosition = 0;
+activeStudent[0] = activeStudent[1] = -1;
+scores[0] = scores[1] = 0;
+currentQuestion = -1;
+screensaverActive = false;
+lastButtonActivityAt = millis();
+randomSeed(esp_random());
+startNextTournamentMatch();
+return true;
+}
+
+uint32_t nextUtf8Codepoint(const char*& text) {
+unsigned char first = (unsigned char)*text++;
+if (first < 0x80) return first;
+if ((first & 0xE0) == 0xC0) {
+uint32_t value = (uint32_t)(first & 0x1F) << 6;
+value |= (unsigned char)*text++ & 0x3F;
+return value;
+}
+if ((first & 0xF0) == 0xE0) {
+uint32_t value = (uint32_t)(first & 0x0F) << 12;
+value |= ((unsigned char)*text++ & 0x3F) << 6;
+value |= (unsigned char)*text++ & 0x3F;
+return value;
+}
+if ((first & 0xF8) == 0xF0) {
+uint32_t value = (uint32_t)(first & 0x07) << 18;
+value |= ((unsigned char)*text++ & 0x3F) << 12;
+value |= ((unsigned char)*text++ & 0x3F) << 6;
+value |= (unsigned char)*text++ & 0x3F;
+return value;
+}
+return first;
+}
+
+uint32_t lowercaseSortCodepoint(uint32_t codepoint) {
+if (codepoint >= 'A' && codepoint <= 'Z') return codepoint + ('a' - 'A');
+if (codepoint >= 0x0410 && codepoint <= 0x042F) return codepoint + 0x20;
+return codepoint;
+}
+
+int compareBulgarianNames(const char* first, const char* second) {
+while (*first && *second) {
+uint32_t a = lowercaseSortCodepoint(nextUtf8Codepoint(first));
+uint32_t b = lowercaseSortCodepoint(nextUtf8Codepoint(second));
+if (a < b) return -1;
+if (a > b) return 1;
+}
+if (*first) return 1;
+if (*second) return -1;
+return 0;
+}
+
+void drawReadyPromptCore(Adafruit_GFX& canvas, U8G2_FOR_ADAFRUIT_GFX& font,
+const char* playerName, int16_t offsetY) {
+canvas.fillScreen(0);
+font.setFont(u8g2_font_8x13_t_cyrillic);
+font.setFontMode(1);
+font.setForegroundColor(1);
+const char* question1 = "Тук ли си,";
+String question2 = String(playerName) + "?";
+if (font.getUTF8Width(question2.c_str()) > 126) font.setFont(u8g2_font_6x12_t_cyrillic);
+font.setFontMode(1);
+font.setForegroundColor(1);
+int16_t x1 = (128 - font.getUTF8Width(question1)) / 2;
+int16_t x2 = (128 - font.getUTF8Width(question2.c_str())) / 2;
+if (x1 < 0) x1 = 0;
+if (x2 < 0) x2 = 0;
+font.drawUTF8(x1, displayTextY(17, offsetY), question1);
+font.drawUTF8(x2, displayTextY(33, offsetY), question2.c_str());
+font.setFont(u8g2_font_5x8_t_cyrillic);
+font.setFontMode(1);
+font.setForegroundColor(1);
+const char* answerA = "А: Да";
+const char* answerB = "Б: Друг играч?";
+font.drawUTF8(0, displayTextY(56, offsetY), answerA);
+int16_t answerBX = 128 - font.getUTF8Width(answerB);
+if (answerBX < 0) answerBX = 0;
+font.drawUTF8(answerBX, displayTextY(56, offsetY), answerB);
+}
+
+void showReadyPrompt(uint8_t player) {
+if (player > 1 || activeStudent[player] < 0) return;
+Adafruit_SH1106G& display = player == 0 ? display1 : display2;
+U8G2_FOR_ADAFRUIT_GFX& font = player == 0 ? font1 : font2;
+int16_t offsetY = player == 0 ? DISPLAY1_VERTICAL_OFFSET_Y : 0;
+drawReadyPromptCore(display, font, studentNames[(uint8_t)activeStudent[player]], offsetY);
+display.display();
+}
+
+void drawPlayerSelectionMenuCore(Adafruit_GFX& canvas, U8G2_FOR_ADAFRUIT_GFX& font,
+uint8_t player, int16_t offsetY) {
+canvas.fillScreen(0);
+font.setFont(u8g2_font_6x12_t_cyrillic);
+font.setFontMode(1);
+font.setForegroundColor(1);
+
+int16_t frameTop = displayTextY(2, offsetY);
+int16_t frameBottom = displayTextY(60, offsetY);
+canvas.drawRoundRect(1, frameTop, 126, frameBottom - frameTop + 1, 4, 1);
+
+font.setFont(u8g2_font_6x12_t_cyrillic);
+font.setFontMode(1);
+font.setForegroundColor(1);
+font.drawUTF8(7, displayTextY(12, offsetY), "Избери играч");
+font.setFont(u8g2_font_5x8_t_cyrillic);
+font.setFontMode(1);
+font.setForegroundColor(1);
+char countLabel[20];
+snprintf(countLabel, sizeof(countLabel), "N=%u", (unsigned)otherPlayerCandidateCount[player]);
+int16_t countX = 122 - font.getUTF8Width(countLabel);
+if (countX < 0) countX = 0;
+font.drawUTF8(countX, displayTextY(11, offsetY), countLabel);
+font.setFont(u8g2_font_6x12_t_cyrillic);
+font.setFontMode(1);
+font.setForegroundColor(1);
+
+if (otherPlayerCandidateCount[player] == 0) {
+font.drawUTF8(8, displayTextY(35, offsetY), "Няма друг играч");
+} else {
+int16_t selectedTop = displayTextY(14, offsetY);
+int16_t selectedBottom = displayTextY(29, offsetY);
+canvas.drawRect(4, selectedTop, 120, selectedBottom - selectedTop + 1, 1);
+canvas.fillRect(6, selectedTop + 2, 116, selectedBottom - selectedTop - 3, 1);
+
+for (uint8_t row = 0; row < 3; row++) {
+uint8_t index = otherPlayerSelection[player] + row;
+if (index >= otherPlayerCandidateCount[player]) break;
+const char* name = studentNames[otherPlayerCandidates[player][index]];
+int16_t baseline = row == 0 ? 24 : (row == 1 ? 39 : 51);
+font.setFont(u8g2_font_6x12_t_cyrillic);
+if (font.getUTF8Width(name) > 108) font.setFont(u8g2_font_5x8_t_cyrillic);
+font.setFontMode(1);
+font.setForegroundColor(row == 0 ? 0 : 1);
+font.drawUTF8(10, displayTextY(baseline, offsetY), name);
+}
+}
+
+font.setFont(u8g2_font_5x8_t_cyrillic);
+font.setFontMode(1);
+font.setForegroundColor(1);
+const char* leftText = otherPlayerCandidateCount[player] ? "А: Избери" : "А: Назад";
+const char* downText = otherPlayerCandidateCount[player] ? "Б: Надолу" : "Б: Назад";
+font.drawUTF8(6, displayTextY(57, offsetY), leftText);
+int16_t downX = 122 - font.getUTF8Width(downText);
+if (downX < 0) downX = 0;
+font.drawUTF8(downX, displayTextY(57, offsetY), downText);
+}
+void showPlayerSelectionMenu(uint8_t player) {
+if (player > 1) return;
+Adafruit_SH1106G& display = player == 0 ? display1 : display2;
+U8G2_FOR_ADAFRUIT_GFX& font = player == 0 ? font1 : font2;
+int16_t offsetY = player == 0 ? DISPLAY1_VERTICAL_OFFSET_Y : 0;
+drawPlayerSelectionMenuCore(display, font, player, offsetY);
+display.display();
+}
+
+void openOtherPlayerMenu(uint8_t player) {
+if (player > 1) return;
+otherPlayerCandidateCount[player] = 0;
+otherPlayerSelection[player] = 0;
+uint8_t present[MAX_STUDENTS];
+uint8_t count = getPresentStudents(present);
+for (uint8_t i = 0; i < count; i++) {
+uint8_t candidate = present[i];
+uint8_t position = otherPlayerCandidateCount[player];
+while (position > 0 && compareBulgarianNames(studentNames[candidate],
+studentNames[otherPlayerCandidates[player][position - 1]]) < 0) {
+otherPlayerCandidates[player][position] = otherPlayerCandidates[player][position - 1];
+position--;
+}
+otherPlayerCandidates[player][position] = candidate;
+otherPlayerCandidateCount[player]++;
+}
+choosingOtherPlayer[player] = true;
+showPlayerSelectionMenu(player);
+}
+
+void selectReplacementPlayer(uint8_t player) {
+if (otherPlayerCandidateCount[player] == 0) {
+choosingOtherPlayer[player] = false;
+showReadyPrompt(player);
+return;
+}
+uint8_t replacement = otherPlayerCandidates[player][otherPlayerSelection[player]];
+choosingOtherPlayer[player] = false;
+
+if (replacement == activeStudent[player]) {
+showReadyPrompt(player);
+return;
+}
+
+if (replacement == activeStudent[1 - player]) {
+int8_t previousPlayer = activeStudent[player];
+activeStudent[player] = activeStudent[1 - player];
+activeStudent[1 - player] = previousPlayer;
+readyForMatch[0] = readyForMatch[1] = false;
+choosingOtherPlayer[0] = choosingOtherPlayer[1] = false;
+showReadyPrompt(0);
+showReadyPrompt(1);
+return;
+}
+
+for (uint8_t i = tournamentOrderPosition; i < tournamentOrderCount; i++) {
+if (tournamentOrder[i] == replacement) {
+for (uint8_t j = i; j + 1 < tournamentOrderCount; j++) tournamentOrder[j] = tournamentOrder[j + 1];
+tournamentOrderCount--;
+break;
+}
+}
+activeStudent[player] = replacement;
+readyForMatch[player] = false;
+showReadyPrompt(player);
+if (readyForMatch[1 - player]) showReadyWaiting(1 - player);
+}
+
+void showReadyWaiting(uint8_t player) {
+if (player > 1 || activeStudent[player] < 0) return;
+Adafruit_SH1106G& display = player == 0 ? display1 : display2;
+U8G2_FOR_ADAFRUIT_GFX& font = player == 0 ? font1 : font2;
+uint8_t other = 1 - player;
+const char* otherName = studentNames[(uint8_t)activeStudent[other]];
+drawMessage(display, font, "", "Изчакваме", otherName, "");
+}
+
+void startNextTournamentMatch() {
+if (!tournamentActive) return;
+if (tournamentOrderPosition + 1 >= tournamentOrderCount) {
+int8_t carryStudent = -1;
+if (tournamentOrderPosition < tournamentOrderCount) carryStudent = (int8_t)tournamentOrder[tournamentOrderPosition];
+shuffleTournamentOrder();
+if (carryStudent >= 0 && tournamentOrderCount > 1) {
+for (uint8_t i = 0; i < tournamentOrderCount; i++) {
+if (tournamentOrder[i] == (uint8_t)carryStudent) {
+uint8_t first = tournamentOrder[0];
+tournamentOrder[0] = tournamentOrder[i];
+tournamentOrder[i] = first;
+break;
+}
+}
+}
+}
+if (tournamentOrderCount < 2) {
+tournamentActive = false;
+tournamentReadyPhase = false;
+activeStudent[0] = activeStudent[1] = -1;
+showTournamentIdle();
+return;
+}
+
+activeStudent[0] = tournamentOrder[tournamentOrderPosition++];
+activeStudent[1] = tournamentOrder[tournamentOrderPosition++];
+screensaverActive = false;
+lastButtonActivityAt = millis();
+scores[0] = scores[1] = 0;
+readyForMatch[0] = readyForMatch[1] = false;
+choosingOtherPlayer[0] = choosingOtherPlayer[1] = false;
+tournamentReadyPhase = true;
+synchronizeButtonStates();
+showReadyPrompt(0);
+showReadyPrompt(1);
+}
+
+void beginTournamentMatch() {
+if (!tournamentActive || !readyForMatch[0] || !readyForMatch[1]) return;
+tournamentReadyPhase = false;
+uint8_t student0 = (uint8_t)activeStudent[0];
+uint8_t student1 = (uint8_t)activeStudent[1];
+sessionMatchesPlayed[student0]++;
+sessionMatchesPlayed[student1]++;
+recordStudentMatchPlayed(student0);
+recordStudentMatchPlayed(student1);
+sessionMatchCount++;
+saveStudentStats();
+synchronizeButtonStates();
+startNewRound();
+}
+
+int compareSessionPlayers(uint8_t a, uint8_t b) {
+if (sessionMatchWins[a] != sessionMatchWins[b]) return sessionMatchWins[a] > sessionMatchWins[b] ? 1 : -1;
+if (sessionCorrectAnswers[a] != sessionCorrectAnswers[b]) return sessionCorrectAnswers[a] > sessionCorrectAnswers[b] ? 1 : -1;
+uint64_t avgA = sessionCorrectAnswers[a] ? sessionCorrectMs[a] / sessionCorrectAnswers[a] : 0;
+uint64_t avgB = sessionCorrectAnswers[b] ? sessionCorrectMs[b] / sessionCorrectAnswers[b] : 0;
+if (avgA != avgB) return avgA < avgB ? 1 : -1;
+return 0;
+}
+
+int findTournamentWinner() {
+int best = -1;
+bool tied = false;
+for (uint8_t i = 0; i < studentCount; i++) {
+if (!sessionMatchesPlayed[i]) continue;
+if (best < 0) { best = i; tied = false; continue; }
+int comparison = compareSessionPlayers(i, best);
+if (comparison > 0) { best = i; tied = false; }
+else if (comparison == 0) tied = true;
+}
+if (tied) return -2;
+return best;
+}
+
+void finishTournament() {
+tournamentActive = false;
+tournamentReadyPhase = false;
+readyForMatch[0] = readyForMatch[1] = false;
+choosingOtherPlayer[0] = choosingOtherPlayer[1] = false;
+activeStudent[0] = activeStudent[1] = -1;
+screensaverActive = false;
+lastButtonActivityAt = millis();
+int winner = findTournamentWinner();
+if (winner == -2) {
+if (displayAvailable[0]) drawMessage(display1, font1, "НАДПРЕВАРАТА", "приключи", "Равенство", "Браво на всички!");
+if (displayAvailable[1]) drawMessage(display2, font2, "НАДПРЕВАРАТА", "приключи", "Равенство", "Браво на всички!");
+} else if (winner < 0) {
+if (displayAvailable[0]) drawMessage(display1, font1, "НАДПРЕВАРАТА", "приключи", "Няма изигран мач", "Опитай отново");
+if (displayAvailable[1]) drawMessage(display2, font2, "НАДПРЕВАРАТА", "приключи", "Няма изигран мач", "Опитай отново");
+} else {
+char wins[32], correct[32];
+snprintf(wins, sizeof(wins), "Победи: %lu", (unsigned long)sessionMatchWins[winner]);
+snprintf(correct, sizeof(correct), "Верни: %lu", (unsigned long)sessionCorrectAnswers[winner]);
+if (displayAvailable[0]) drawMessage(display1, font1, "ПОБЕДИТЕЛ:", studentNames[winner], wins, correct);
+if (displayAvailable[1]) drawMessage(display2, font2, "ПОБЕДИТЕЛ:", studentNames[winner], wins, correct);
+}
+}
+
+void synchronizeButtonStates() {
+unsigned long now = millis();
+for (uint8_t i = 0; i < 4; i++) {
+bool reading = digitalRead(BUTTON_PINS[i]);
+buttonStable[i] = reading;
+buttonLastReading[i] = reading;
+buttonLastChange[i] = now;
+}
+}
+
+void showCurrentQuestion();
+
+void drawScreensaverCore(Adafruit_GFX& canvas,
+U8G2_FOR_ADAFRUIT_GFX& font,
+int16_t offsetY) {
+canvas.fillScreen(0);
+font.setFontMode(1);
+font.setForegroundColor(1);
+
+struct tm t;
+char clockText[8] = "--:--";
+char weekdayText[32] = "няма интернет";
+char dateText[32] = "--";
+if (getLocalDateTime(t)) {
+strftime(clockText, sizeof(clockText), "%H:%M", &t);
+strlcpy(weekdayText, WEEKDAYS_BG[t.tm_wday], sizeof(weekdayText));
+snprintf(dateText, sizeof(dateText), "%d %s", t.tm_mday, MONTHS_BG[t.tm_mon]);
+}
+
+// Large numeric clock, followed by two centered Cyrillic date lines.
+font.setFont(u8g2_font_logisoso24_tn);
+int16_t clockX = (128 - font.getUTF8Width(clockText)) / 2;
+if (clockX < 0) clockX = 0;
+font.drawUTF8(clockX, displayTextY(28, offsetY), clockText);
+
+font.setFont(u8g2_font_6x12_t_cyrillic);
+int16_t weekdayX = (128 - font.getUTF8Width(weekdayText)) / 2;
+if (weekdayX < 0) weekdayX = 0;
+font.drawUTF8(weekdayX, displayTextY(42, offsetY), weekdayText);
+
+int16_t dateX = (128 - font.getUTF8Width(dateText)) / 2;
+if (dateX < 0) dateX = 0;
+font.drawUTF8(dateX, displayTextY(56, offsetY), dateText);
+}
+
+void showScreensaver() {
+if (displayAvailable[0]) {
+drawScreensaverCore(display1, font1, DISPLAY1_VERTICAL_OFFSET_Y);
+display1.display();
+}
+if (displayAvailable[1]) {
+drawScreensaverCore(display2, font2, 0);
+display2.display();
+}
+}
+
+void updateScreensaver() {
+unsigned long now = millis();
+if (!screensaverActive && now - lastButtonActivityAt >= SCREENSAVER_IDLE_MS) {
+screensaverActive = true;
+showScreensaver();
+lastClockFrameAt = now;
+} else if (screensaverActive && now - lastClockFrameAt >= 1000UL) {
+showScreensaver();
+lastClockFrameAt = now;
+}
+}
+
+void wakeScreensaver() {
+lastButtonActivityAt = millis();
+if (screensaverActive) {
+screensaverActive = false;
+if (gameMode == GAME_MODE_TOURNAMENT && !tournamentActive) showTournamentIdle();
+else if (tournamentReadyPhase) {
+for (uint8_t p = 0; p < 2; p++) {
+if (choosingOtherPlayer[p]) showPlayerSelectionMenu(p);
+else if (readyForMatch[p]) showReadyWaiting(p);
+else showReadyPrompt(p);
+}
+} else if (QUESTION_COUNT > 0 && currentQuestion >= 0) showCurrentQuestion();
+}
+}
+
+void showCurrentQuestion() {
+Question& q = questions[currentQuestion];
+String line1 = expandTemplate(q.line1);
+String line2 = expandTemplate(q.line2);
+String optionA = expandTemplate(q.answerA);
+String optionB = expandTemplate(q.answerB);
+
+if (displayAvailable[0]) {
+drawQuestion(display1, font1, line1.c_str(), line2.c_str(), optionA.c_str(), optionB.c_str());
+}
+if (displayAvailable[1]) {
+drawQuestion(display2, font2, line1.c_str(), line2.c_str(), optionA.c_str(), optionB.c_str());
+}
+}
+
+void startNewRound() {
+if (gameMode == GAME_MODE_TOURNAMENT && !tournamentActive) {
+showTournamentIdle();
+return;
+}
+if (QUESTION_COUNT == 0) {
+if (displayAvailable[0]) drawMessage(display1, font1, "", "Няма въпроси", "Отвори уеб", "интерфейса");
+if (displayAvailable[1]) drawMessage(display2, font2, "", "Няма въпроси", "Отвори уеб", "интерфейса");
+return;
+}
+// Questions follow the array order and restart from the first after the last.
+currentQuestion++;
+if (currentQuestion >= QUESTION_COUNT) currentQuestion = 0;
+correctButton = questions[currentQuestion].correctAnswer;
+
+answered[0] = false;
+answered[1] = false;
+answerWasCorrect[0] = false;
+answerWasCorrect[1] = false;
+
+showCurrentQuestion();
+roundStartTime = millis();
+}
+
+bool buttonPressed(uint8_t index) {
+bool reading = digitalRead(BUTTON_PINS[index]);
+
+if (reading != buttonLastReading[index]) {
+buttonLastChange[index] = millis();
+buttonLastReading[index] = reading;
+}
+
+if (millis() - buttonLastChange[index] > 25 &&
+reading != buttonStable[index]) {
+buttonStable[index] = reading;
+if (buttonStable[index] == LOW) {
+wakeScreensaver();
+return true;
+}
+return false;
+}
+
+return false;
+}
+
+void buzzerBegin() {
+#if ESP_ARDUINO_VERSION_MAJOR >= 3
+ledcAttach(BUZZER_PIN, 2000, 10);
+#else
+ledcSetup(BUZZER_CHANNEL, 2000, 10);
+ledcAttachPin(BUZZER_PIN, BUZZER_CHANNEL);
+#endif
+ledcWriteTone(
+#if ESP_ARDUINO_VERSION_MAJOR >= 3
+BUZZER_PIN,
+#else
+BUZZER_CHANNEL,
+#endif
+0
+);
+}
+
+void buzzerSetTone(uint16_t frequency) {
+#if ESP_ARDUINO_VERSION_MAJOR >= 3
+ledcWriteTone(BUZZER_PIN, frequency);
+#else
+ledcWriteTone(BUZZER_CHANNEL, frequency);
+#endif
+}
+
+void buzzerStop() {
+buzzerSetTone(0);
+}
+
+void restartProgram() {
+shortBeepActive = false;
+buzzerStop();
+
+if (displayAvailable[0]) {
+drawMessage(display1, font1, "", "Рестартирам се", "", "");
+}
+if (displayAvailable[1]) {
+drawMessage(display2, font2, "", "Рестартирам се", "", "");
+}
+
+delay(700);
+esp_restart();
+}
+
+// A + Б held together by either player restarts the ESP32 after 3 seconds.
+// Returns true while any restart chord is held, suppressing answer registration.
+bool checkRestartGesture() {
+bool anyChordHeld = false;
+unsigned long now = millis();
+
+for (uint8_t player = 0; player < 2; player++) {
+uint8_t firstButton = player * 2;
+bool bothHeld = digitalRead(BUTTON_PINS[firstButton]) == LOW &&
+digitalRead(BUTTON_PINS[firstButton + 1]) == LOW;
+
+if (bothHeld) {
+anyChordHeld = true;
+if (!restartChordTiming[player]) {
+restartChordTiming[player] = true;
+restartChordStartedAt[player] = now;
+wakeScreensaver();
+} else if (now - restartChordStartedAt[player] >= RESTART_HOLD_MS) {
+restartProgram();
+return true;
+}
+} else {
+restartChordTiming[player] = false;
+}
+
+}
+
+return anyChordHeld;
+}
+
+void startShortBeep(uint8_t player) {
+buzzerSetTone(player == 0 ? PLAYER1_BEEP_HZ : PLAYER2_BEEP_HZ);
+shortBeepActive = true;
+shortBeepOffAt = millis() + SHORT_BEEP_MS;
+}
+
+void updateBuzzer() {
+if (shortBeepActive && (long)(millis() - shortBeepOffAt) >= 0) {
+buzzerStop();
+shortBeepActive = false;
+}
+}
+
+void delayWhileUpdatingBuzzer(unsigned long durationMs) {
+unsigned long startedAt = millis();
+while (millis() - startedAt < durationMs) {
+webServer.handleClient();
+updateBuzzer();
+checkRestartGesture();
+delay(1);
+}
+}
+
+void recordAnswer(uint8_t player, uint8_t choice) {
+if (answered[player]) return;
+
+answered[player] = true;
+answerTime[player] = millis();
+answerWasCorrect[player] = (choice == correctButton);
+startShortBeep(player);
+
+if (tournamentActive && activeStudent[player] >= 0) {
+uint8_t student = (uint8_t)activeStudent[player];
+uint32_t responseMs = answerTime[player] - roundStartTime;
+recordStudentAnswer(student, answerWasCorrect[player], responseMs);
+if (answerWasCorrect[player]) {
+sessionCorrectAnswers[student]++;
+sessionCorrectMs[student] += responseMs;
+}
+}
+
+if (soloMode) return;
+
+if (player == 0 && displayAvailable[0]) {
+drawMessage(display1, font1, "", "Отговорът е приет", "Изчакай съученика", "");
+} else if (player == 1 && displayAvailable[1]) {
+drawMessage(display2, font2, "", "Отговорът е", "Изчакай съученика", "");
+}
+}
+
+void drawVictoryCore(Adafruit_GFX& canvas,
+U8G2_FOR_ADAFRUIT_GFX& font,
+bool visible, int16_t offsetY) {
+canvas.fillScreen(0);
+if (visible) {
+font.setFont(u8g2_font_6x13B_t_cyrillic);
+font.setFontMode(1);
+font.setForegroundColor(1);
+
+const char* lines[] = {"БРАВО! ВИЕ", "СПЕЧЕЛИХТЕ!"};
+const int16_t baselines[] = {35, 54};
+
+for (uint8_t i = 0; i < 2; i++) {
+int16_t x = (128 - font.getUTF8Width(lines[i])) / 2;
+font.drawUTF8(x, displayTextY(baselines[i], offsetY), lines[i]);
+}
+
+}
+}
+
+void showVictoryFrame(bool visible) {
+if (displayAvailable[0]) {
+drawVictoryCore(display1, font1, visible, DISPLAY1_VERTICAL_OFFSET_Y);
+display1.display();
+}
+if (displayAvailable[1]) {
+drawVictoryCore(display2, font2, visible, 0);
+display2.display();
+}
+}
+
+void celebrateAndRestart() {
+shortBeepActive = false;
+buzzerStop();
+
+unsigned long startedAt = millis();
+unsigned long nextBlinkAt = startedAt;
+unsigned long nextNoteAt = startedAt;
+unsigned long noteEndsAt = startedAt;
+uint8_t noteIndex = 0;
+uint8_t victoryPlayCount = 0;
+bool notePlaying = false;
+bool visible = true;
+
+// Blink the victory message for 15 seconds and play exactly five full fanfares.
+while (millis() - startedAt < VICTORY_DURATION_MS) {
+unsigned long now = millis();
+checkRestartGesture();
+
+if ((long)(now - nextBlinkAt) >= 0) {
+showVictoryFrame(visible);
+visible = !visible;
+nextBlinkAt = now + 500;
+}
+
+if (notePlaying && (long)(now - noteEndsAt) >= 0) {
+buzzerStop();
+notePlaying = false;
+nextNoteAt = now + VICTORY_GAP_MS;
+}
+
+if (!notePlaying && victoryPlayCount < VICTORY_REPEAT_COUNT &&
+(long)(now - nextNoteAt) >= 0) {
+buzzerSetTone(VICTORY_NOTES[noteIndex]);
+noteEndsAt = now + VICTORY_NOTE_MS[noteIndex];
+noteIndex++;
+if (noteIndex >= VICTORY_NOTE_COUNT) {
+noteIndex = 0;
+victoryPlayCount++;
+}
+notePlaying = true;
+}
+
+delay(5);
+
+}
+
+buzzerStop();
+scores[0] = 0;
+scores[1] = 0;
+startNewRound();
+}
+
+void finishSoloRound() {
+uint8_t player = soloPlayer;
+Adafruit_SH1106G& display = player == 0 ? display1 : display2;
+U8G2_FOR_ADAFRUIT_GFX& font = player == 0 ? font1 : font2;
+
+if (answerWasCorrect[player]) {
+scores[player]++;
+char scoreLine[24];
+snprintf(scoreLine, sizeof(scoreLine), "%u / %u точки", (unsigned)scores[player], (unsigned)TOTAL_POINTS_TO_WIN);
+drawMessage(display, font, "Ти спечели", "точка!", "Резултат:", scoreLine);
+} else {
+char scoreLine[24];
+snprintf(scoreLine, sizeof(scoreLine), "%u / %u точки", (unsigned)scores[player], (unsigned)TOTAL_POINTS_TO_WIN);
+drawMessage(display, font, "Грешен отговор", "Няма точка", "Резултат:", scoreLine);
+}
+
+delayWhileUpdatingBuzzer(1800);
+
+if (scores[player] >= TOTAL_POINTS_TO_WIN) {
+celebrateAndRestart();
+} else {
+startNewRound();
+}
+}
+
+void finishRound() {
+flushStudentStats();
+bool tournamentRound = tournamentActive;
+int winner = -1;
+bool tiedCorrectAnswers = false;
+
+if (answerWasCorrect[0] && answerWasCorrect[1]) {
+if (answerTime[0] < answerTime[1]) winner = 0;
+else if (answerTime[1] < answerTime[0]) winner = 1;
+else tiedCorrectAnswers = true;
+} else if (answerWasCorrect[0]) {
+winner = 0;
+} else if (answerWasCorrect[1]) {
+winner = 1;
+}
+
+if (winner >= 0) {
+scores[winner]++;
+
+if (winner == 0) {
+drawMessage(display1, font1, "Ти спечели", "точка!", "", "");
+drawMessage(display2, font2, "Твоят съученик", "спечели точка!", "", "");
+} else {
+drawMessage(display2, font2, "Ти спечели", "точка!", "", "");
+drawMessage(display1, font1, "Твоят съученик", "спечели точка!", "", "");
+}
+
+} else if (tiedCorrectAnswers) {
+drawMessage(display1, font1, "", "Равенство", "Няма точка", "");
+drawMessage(display2, font2, "", "Равенство", "Няма точка", "");
+} else {
+drawMessage(display1, font1, "", "Двата отговора", "са грешни", "");
+drawMessage(display2, font2, "", "Двата отговора", "са грешни", "");
+}
+
+delayWhileUpdatingBuzzer(1800);
+
+if (tournamentRound) {
+if (!tournamentActive) return; // The teacher may end the tournament from the web page during the message.
+if (scores[0] >= tournamentPointsToWin || scores[1] >= tournamentPointsToWin) {
+uint8_t winnerPlayer = scores[0] > scores[1] ? 0 : 1;
+uint8_t winningStudent = (uint8_t)activeStudent[winnerPlayer];
+sessionMatchWins[winningStudent]++;
+recordStudentMatchWon(winningStudent);
+saveOneStudentStats(winningStudent);
+char scoreLine[24];
+snprintf(scoreLine, sizeof(scoreLine), "%u - %u точки", (unsigned)scores[0], (unsigned)scores[1]);
+if (displayAvailable[0]) drawMessage(display1, font1, "Мачът спечели:", studentNames[winningStudent], "Резултат:", scoreLine);
+if (displayAvailable[1]) drawMessage(display2, font2, "Мачът спечели:", studentNames[winningStudent], "Резултат:", scoreLine);
+delayWhileUpdatingBuzzer(1800);
+if (tournamentActive) startNextTournamentMatch();
+} else {
+startNewRound();
+}
+return;
+}
+
+if (scores[0] + scores[1] >= TOTAL_POINTS_TO_WIN) {
+celebrateAndRestart();
+} else {
+startNewRound();
+}
+}
+
+void setup() {
+Serial.begin(115200);
+randomSeed(esp_random());
+pinMode(BUZZER_PIN, OUTPUT);
+buzzerBegin();
+
+for (uint8_t i = 0; i < 4; i++) {
+pinMode(BUTTON_PINS[i], INPUT_PULLUP);
+}
+
+loadQuestionsFromStorage();
+loadClassSettings();
+previewFont.begin(previewCanvas);
+
+Wire.begin(21, 22);
+I2C_2.begin(25, 26);
+
+displayAvailable[0] = display1.begin(0x3C, true);
+if (displayAvailable[0]) {
+font1.begin(display1);
+} else {
+Serial.println("Display 1 не е открит; ще се използва Display 2, ако е наличен.");
+}
+
+displayAvailable[1] = display2.begin(0x3C, true);
+if (displayAvailable[1]) {
+font2.begin(display2);
+} else {
+Serial.println("Display 2 не е открит; ще се използва Display 1, ако е наличен.");
+}
+
+if (!displayAvailable[0] && !displayAvailable[1]) {
+Serial.println("Не е открит дисплей. Играта няма визуален изход.");
+}
+
+soloMode = displayAvailable[0] != displayAvailable[1];
+if (soloMode) {
+soloPlayer = displayAvailable[0] ? 0 : 1;
+Serial.println("Самостоятелен режим: използват се бутоните на играча с работещия дисплей.");
+}
+
+startWebInterface();
+lastButtonActivityAt = millis();
+if (gameMode == GAME_MODE_TOURNAMENT) {
+if (!soloMode && startTournament()) return;
+showTournamentIdle();
+} else {
+startNewRound();
+}
+}
+
+void loop() {
+webServer.handleClient();
+updateBuzzer();
+updateScreensaver();
+
+if (checkRestartGesture()) return;
+if ((!displayAvailable[0] && !displayAvailable[1]) || QUESTION_COUNT == 0) return;
+if (gameMode == GAME_MODE_TOURNAMENT && !tournamentActive) return;
+if (tournamentReadyPhase) {
+for (uint8_t player = 0; player < 2; player++) {
+uint8_t buttonA = player * 2;
+uint8_t buttonB = buttonA + 1;
+if (choosingOtherPlayer[player]) {
+if (buttonPressed(buttonA)) {
+selectReplacementPlayer(player);
+} else if (buttonPressed(buttonB)) {
+if (otherPlayerCandidateCount[player] > 0) {
+otherPlayerSelection[player]++;
+if (otherPlayerSelection[player] >= otherPlayerCandidateCount[player]) otherPlayerSelection[player] = 0;
+showPlayerSelectionMenu(player);
+} else {
+choosingOtherPlayer[player] = false;
+showReadyPrompt(player);
+}
+}
+} else if (!readyForMatch[player]) {
+if (buttonPressed(buttonA)) {
+readyForMatch[player] = true;
+showReadyWaiting(player);
+} else if (buttonPressed(buttonB)) {
+openOtherPlayerMenu(player);
+}
+}
+}
+if (readyForMatch[0] && readyForMatch[1] && !choosingOtherPlayer[0] && !choosingOtherPlayer[1]) beginTournamentMatch();
+return;
+}
+
+if (soloMode) {
+uint8_t firstButton = soloPlayer * 2;
+if (!answered[soloPlayer]) {
+if (buttonPressed(firstButton)) recordAnswer(soloPlayer, 0);
+if (!answered[soloPlayer] && buttonPressed(firstButton + 1)) {
+recordAnswer(soloPlayer, 1);
+}
+}
+if (answered[soloPlayer]) finishSoloRound();
+return;
+}
+
+if (!answered[0]) {
+if (buttonPressed(0)) recordAnswer(0, 0); // Играч 1, A
+if (!answered[0] && buttonPressed(1)) recordAnswer(0, 1); // Играч 1, B
+}
+
+if (!answered[1]) {
+if (buttonPressed(2)) recordAnswer(1, 0); // Играч 2, A
+if (!answered[1] && buttonPressed(3)) recordAnswer(1, 1); // Играч 2, B
+}
+
+flushStudentStats();
+if (answered[0] && answered[1]) {
+finishRound();
+}
+}
